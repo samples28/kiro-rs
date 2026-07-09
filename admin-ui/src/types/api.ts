@@ -80,6 +80,7 @@ export interface SetPriorityRequest {
 export interface AddCredentialRequest {
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key' | 'enterprise' | 'builderid'
+  profileArn?: string
   clientId?: string
   clientSecret?: string
   priority?: number

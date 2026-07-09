@@ -30,6 +30,7 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState(savedProxy?.proxyUrl ?? '')
@@ -48,6 +49,7 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setProfileArn('')
     setPriority('0')
     setMachineId('')
     setEndpoint('')
@@ -74,6 +76,10 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (authMethod === 'idc' && !profileArn.trim()) {
+        toast.error('IdC/Builder-ID/IAM 认证需要填写 Profile ARN')
+        return
+      }
     }
 
     mutate(
@@ -85,6 +91,7 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        profileArn: profileArn.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
@@ -230,6 +237,21 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
                   />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="profileArn" className="text-sm font-medium">
+                    Profile ARN <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="profileArn"
+                    placeholder="arn:aws:codewhisperer:{region}:{account}:profile/{id}"
+                    value={profileArn}
+                    onChange={(e) => setProfileArn(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    IdC/企业版认证必须提供。可从 AWS Console 或 Kiro IDE 的 credentials 文件中获取
+                  </p>
                 </div>
               </>
             )}
