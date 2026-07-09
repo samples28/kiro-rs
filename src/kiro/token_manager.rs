@@ -318,7 +318,178 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // IdC 凭据如果没有 profile_arn，自动通过 CreateProfile API 获取
+    if new_credentials.profile_arn.is_none() {
+        match fetch_idc_profile_arn(&new_credentials, config, new_credentials.access_token.as_ref().unwrap(), proxy).await {
+            Ok(Some(arn)) => {
+                tracing::info!("自动获取 IdC profileArn: {}", arn);
+                new_credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {
+                tracing::warn!("未能自动获取 IdC profileArn（API 返回空），后续 API 调用可能失败");
+            }
+            Err(e) => {
+                tracing::warn!("自动获取 IdC profileArn 失败: {:#}", e);
+            }
+        }
+    }
+
     Ok(new_credentials)
+}
+
+/// 为 IdC 凭据自动获取 profileArn
+///
+/// 调用 Q Developer 的 CreateProfile API 创建/获取 profile ARN。
+/// 如果 profile 已存在则返回已有的 ARN。
+async fn fetch_idc_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let url = format!("https://{}/CreateProfile", host);
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        kiro_version, machine_id
+    );
+
+    let body = serde_json::json!({
+        "profileName": "KiroIDE"
+    });
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        // 409 Conflict 表示 profile 已存在，尝试 ListProfiles 获取
+        if status.as_u16() == 409 {
+            tracing::debug!(
+                "CreateProfile 返回 409（profile 已存在），尝试 ListProfiles"
+            );
+            return fetch_idc_profile_arn_from_list(
+                credentials, config, token, proxy,
+            )
+            .await;
+        }
+        tracing::warn!(
+            "CreateProfile 失败: {} {} — {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or(""),
+            body_text
+        );
+        return Ok(None);
+    }
+
+    // 解析响应获取 profileArn
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        if let Some(arn) = json.get("profileArn").and_then(|v| v.as_str()) {
+            return Ok(Some(arn.to_string()));
+        }
+    }
+
+    tracing::warn!("CreateProfile 响应中未找到 profileArn: {}", body_text);
+    Ok(None)
+}
+
+/// 从 ListProfiles 获取已有的 profileArn（CreateProfile 409 时的回退方案）
+async fn fetch_idc_profile_arn_from_list(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let url = format!("https://{}/ListProfiles", host);
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        kiro_version, machine_id
+    );
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        tracing::warn!(
+            "ListProfiles 失败: {} {} — {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or(""),
+            body_text
+        );
+        return Ok(None);
+    }
+
+    // 解析响应，取第一个 profile
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        if let Some(profiles) = json.get("profiles").and_then(|v| v.as_array()) {
+            if let Some(first) = profiles.first() {
+                if let Some(arn) = first.get("profileArn").and_then(|v| v.as_str()) {
+                    return Ok(Some(arn.to_string()));
+                }
+            }
+        }
+        // 有些 API 版本直接在根级别返回 profileArn
+        if let Some(arn) = json.get("profileArn").and_then(|v| v.as_str()) {
+            return Ok(Some(arn.to_string()));
+        }
+    }
+
+    tracing::warn!("ListProfiles 响应中未找到 profileArn: {}", body_text);
+    Ok(None)
 }
 
 /// 获取使用额度信息

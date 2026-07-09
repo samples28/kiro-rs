@@ -280,7 +280,7 @@ impl AdminService {
                 id: None,
                 access_token: None,
                 refresh_token: req.refresh_token,
-                profile_arn: None,
+                profile_arn: req.profile_arn,
                 expires_at: None,
                 auth_method: Some(req.auth_method),
                 client_id: req.client_id,

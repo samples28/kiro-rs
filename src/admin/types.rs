@@ -119,6 +119,10 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
+    /// Profile ARN（IdC/企业版认证需要，可选）
+    /// 格式: arn:aws:codewhisperer:{region}:{account}:profile/{id}
+    pub profile_arn: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,
 
