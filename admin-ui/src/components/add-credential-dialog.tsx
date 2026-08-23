@@ -76,10 +76,6 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
-      if (authMethod === 'idc' && !profileArn.trim()) {
-        toast.error('IdC/Builder-ID/IAM 认证需要填写 Profile ARN')
-        return
-      }
     }
 
     mutate(
@@ -240,7 +236,7 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
                 </div>
                 <div className="space-y-2">
                   <label htmlFor="profileArn" className="text-sm font-medium">
-                    Profile ARN <span className="text-red-500">*</span>
+                    Profile ARN <span className="text-muted-foreground">(选填)</span>
                   </label>
                   <Input
                     id="profileArn"
@@ -250,7 +246,8 @@ export function AddCredentialDialog({ open, onOpenChange, onBalanceUpdate }: Add
                     disabled={isPending}
                   />
                   <p className="text-xs text-muted-foreground">
-                    IdC/企业版认证必须提供。可从 AWS Console 或 Kiro IDE 的 credentials 文件中获取
+                    可留空，Token 刷新时会自动使用上游返回的值。也可从 AWS Console 或 Kiro IDE 的
+                    credentials 文件中获取
                   </p>
                 </div>
               </>
