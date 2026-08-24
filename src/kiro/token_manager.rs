@@ -25,6 +25,16 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+/// 用量类 REST 接口（getUsageLimits / setUserPreference）固定使用的 Kiro IDE 版本。
+///
+/// 上游按 User-Agent 中的 Kiro 版本号决定是否强制要求 `profileArn`：新版 IDE
+/// 对这些接口强制要求，导致个人 BuilderID / Enterprise / IdC 账号收到
+/// `400 {"message":"Invalid profileArn."}`。该版本无需 profileArn 即可返回
+/// 订阅与用量数据。
+///
+/// 流式端点 `generateAssistantResponse` 不受影响，仍使用 `config.kiro_version`。
+pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -334,20 +344,22 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    // 用量类接口固定使用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
+    // 对个人 BuilderID / Enterprise / IdC 账号会返回
+    // 400 {"message":"Invalid profileArn."}；该版本无需 profileArn。
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
     // 构建 URL
-    let mut url = format!(
+    //
+    // 注意：这里刻意不拼接 profileArn。Kiro 0.9.2 的该接口不接受该参数，
+    // 即使凭据持有真实 ARN，带上也会让请求 malformed。profileArn 只用于
+    // 流式端点 generateAssistantResponse。
+    let url = format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -405,7 +417,8 @@ pub(crate) async fn set_user_preference(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    // 同 getUsageLimits：用量类 REST 接口固定用旧版本，避免上游强制要求 profileArn
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
