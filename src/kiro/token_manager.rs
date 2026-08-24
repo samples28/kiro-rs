@@ -436,7 +436,8 @@ pub(crate) async fn set_user_preference(
     let mut body = serde_json::json!({
         "overageConfiguration": { "overageStatus": overage_status }
     });
-    if let Some(profile_arn) = &credentials.profile_arn {
+    // 用量类接口只带真实 ARN：BuilderID 占位符会让上游返回 400 Invalid profileArn.
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
         body["profileArn"] = serde_json::json!(profile_arn);
     }
 
@@ -1917,7 +1918,8 @@ impl MultiTokenManager {
                     } else {
                         e.credentials.auth_method.clone()
                     },
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
+                    // 只有真实 ARN 才算「已配置」：空串与 BuilderID 占位符都不算
+                    has_profile_arn: e.credentials.effective_profile_arn().is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {

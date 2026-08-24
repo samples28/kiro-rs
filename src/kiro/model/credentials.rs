@@ -138,6 +138,21 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// BuilderID 占位 profileArn
+///
+/// 纯 BuilderID 账号没有可解析的真实 profile，但新版 Kiro 的流式端点强制要求该
+/// 字段存在。此占位值仅用于通过流式端点的存在性校验，**不是**真实可用的 profile，
+/// 因此用量类 / 头部类调用必须跳过（见 [`is_placeholder_profile_arn`]）。
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+/// Social 登录（Github / Google）共享 profileArn
+///
+/// 与 [`BUILDER_ID_PROFILE_ARN`] 不同，这是真实可用的共享 ARN，不算占位符，
+/// 用量类 / 头部类调用可以正常发送。
+pub const SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
@@ -295,6 +310,67 @@ impl KiroCredentials {
         free_model_mappings.iter().any(|mapping| m.contains(&mapping.from.to_lowercase()))
     }
 
+    /// 是否为 Social 登录（Github / Google）
+    ///
+    /// 本仓库的 `KiroCredentials` 没有 `provider` 字段，仅按 `auth_method` 判断。
+    fn is_social_login(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("social"))
+            .unwrap_or(false)
+    }
+
+    /// 凭据缺少显式 profileArn 时应使用的默认 ARN
+    ///
+    /// Social 登录用共享 Social ARN，其余（BuilderID 等）用 BuilderID 占位符。
+    fn default_profile_arn(&self) -> &'static str {
+        if self.is_social_login() {
+            SOCIAL_PROFILE_ARN
+        } else {
+            BUILDER_ID_PROFILE_ARN
+        }
+    }
+
+    /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）
+    ///
+    /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
+    /// - [`BUILDER_ID_PROFILE_ARN`] 占位符 → 返回 `None`（用量类 / 头部类调用不应
+    ///   发送占位符，否则上游会因 ARN 无法解析而返回
+    ///   `400 {"message":"Invalid profileArn."}`）；
+    /// - 空串 / 纯空白（提取器导出的 `"profileArn": ""`）→ 返回 `None`。
+    ///
+    /// 流式请求请改用 [`Self::streaming_profile_arn`]。
+    pub fn effective_profile_arn(&self) -> Option<&str> {
+        match self.profile_arn.as_deref().map(str::trim) {
+            Some(arn) if !arn.is_empty() && !is_placeholder_profile_arn(arn) => Some(arn),
+            _ => None,
+        }
+    }
+
+    /// 返回流式端点（`generateAssistantResponse`）应发送的 profileArn
+    ///
+    /// 新版上游对流式端点强制要求 `profileArn`，缺失会返回
+    /// `400 {"message":"profileArn is required for this request."}`。Enterprise / IdC
+    /// 账号的真实 ARN 由 Token 刷新流程回填（见 `refresh_idc_token`）；纯 BuilderID
+    /// 账号没有可解析的真实 profile，按官方 IDE 行为发送 BuilderID 占位符。
+    ///
+    /// - 已有显式 profileArn（真实 ARN / Social ARN / 占位符）→ 原样返回；
+    /// - 尚未填充 → 按登录方式推断（Social → Social ARN，其余 → BuilderID 占位符）；
+    /// - API Key 凭据无 profileArn 概念 → 返回 `None`。
+    pub fn streaming_profile_arn(&self) -> Option<String> {
+        if self.is_api_key_credential() {
+            return None;
+        }
+        Some(
+            self.profile_arn
+                .as_deref()
+                .map(str::trim)
+                .filter(|arn| !arn.is_empty())
+                .unwrap_or_else(|| self.default_profile_arn())
+                .to_string(),
+        )
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
@@ -306,6 +382,11 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+}
+
+/// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）
+pub fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn == BUILDER_ID_PROFILE_ARN
 }
 
 #[cfg(test)]
@@ -323,6 +404,106 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn test_is_placeholder_profile_arn() {
+        assert!(is_placeholder_profile_arn(BUILDER_ID_PROFILE_ARN));
+        // Social 共享 ARN 是真实可用的，不算占位符
+        assert!(!is_placeholder_profile_arn(SOCIAL_PROFILE_ARN));
+        assert!(!is_placeholder_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123"
+        ));
+    }
+
+    /// effective_profile_arn：用量类 / 头部类调用可发送的真实 ARN
+    #[test]
+    fn test_effective_profile_arn_skips_placeholder() {
+        let mut cred = KiroCredentials::default();
+        assert_eq!(cred.effective_profile_arn(), None, "未设置时应为 None");
+
+        // BuilderID 占位符 → 跳过
+        cred.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(cred.effective_profile_arn(), None, "占位符不应发送");
+
+        // Social 共享 ARN → 原样返回
+        cred.profile_arn = Some(SOCIAL_PROFILE_ARN.to_string());
+        assert_eq!(cred.effective_profile_arn(), Some(SOCIAL_PROFILE_ARN));
+
+        // 真实 Enterprise ARN → 原样返回
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        cred.profile_arn = Some(real.to_string());
+        assert_eq!(cred.effective_profile_arn(), Some(real));
+    }
+
+    /// 提取器导出的空串 / 纯空白都视为「没有 ARN」
+    #[test]
+    fn test_effective_profile_arn_blank_is_none() {
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn = Some(String::new());
+        assert_eq!(cred.effective_profile_arn(), None, "空串应视为无 ARN");
+
+        cred.profile_arn = Some("   ".to_string());
+        assert_eq!(cred.effective_profile_arn(), None, "纯空白应视为无 ARN");
+    }
+
+    /// streaming_profile_arn：流式端点按账号类型注入
+    #[test]
+    fn test_streaming_profile_arn_by_account_type() {
+        // 默认（BuilderID）→ 占位符
+        let mut cred = KiroCredentials::default();
+        assert_eq!(
+            cred.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        // Social 登录 → Social 共享 ARN
+        cred.auth_method = Some("social".to_string());
+        assert_eq!(
+            cred.streaming_profile_arn().as_deref(),
+            Some(SOCIAL_PROFILE_ARN)
+        );
+
+        // idc → 占位符（真实 ARN 由刷新流程回填）
+        cred.auth_method = Some("idc".to_string());
+        assert_eq!(
+            cred.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        // 已有真实 ARN → 原样发送
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        cred.profile_arn = Some(real.to_string());
+        assert_eq!(cred.streaming_profile_arn().as_deref(), Some(real));
+    }
+
+    /// API Key 凭据无 profileArn 概念
+    #[test]
+    fn test_streaming_profile_arn_none_for_api_key() {
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        assert_eq!(cred.streaming_profile_arn(), None);
+    }
+
+    /// 空串视为未填充，按账号类型推断而非发送空串
+    #[test]
+    fn test_streaming_profile_arn_blank_falls_back() {
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn = Some(String::new());
+        assert_eq!(
+            cred.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    /// 两个常量必须是合法的 codewhisperer profile ARN 形状且互不相同
+    #[test]
+    fn test_profile_arn_constants_shape() {
+        for arn in [BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN] {
+            assert!(arn.starts_with("arn:aws:codewhisperer:"));
+            assert!(arn.contains(":profile/"));
+        }
+        assert_ne!(BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN);
+    }
 
     #[test]
     fn test_from_json() {
