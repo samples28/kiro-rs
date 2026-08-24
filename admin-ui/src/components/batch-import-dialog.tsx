@@ -20,23 +20,25 @@ interface BatchImportDialogProps {
   onBalanceUpdate?: (id: number, balance: import('@/types/api').BalanceResponse) => void
 }
 
-// 统一的输入格式：把通用 JSON 与 KAM 格式（{accounts:[...]}、credentials 嵌套、平铺）归一化到这个结构
+// 统一的输入格式：把通用 JSON、KAM 格式（{accounts:[...]}、credentials 嵌套、平铺）
+// 与提取器格式（kiro_personal：apiKey / provider / plan / credits_* 等）归一化到这个结构
 interface CredentialInput {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
+  profileArn?: string
   region?: string
   authRegion?: string
   apiRegion?: string
   priority?: number
   machineId?: string
   kiroApiKey?: string
-  authMethod?: string
+  authMethod?: 'social' | 'idc' | 'enterprise' | 'builderid' | 'api_key'
   endpoint?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
-  // 仅用于 KAM 格式的展示与跳过
+  // 仅用于展示与跳过
   email?: string
   password?: string
   nickname?: string
@@ -54,96 +56,179 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+// 按顺序取第一个非空字符串字段（兼容 camelCase / snake_case 别名）
+function pickStr(
+  obj: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string' && value.trim().length > 0) return value.trim()
+  }
+  return undefined
+}
+
+function pickNum(obj: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+      return Number(value)
+    }
+  }
+  return undefined
+}
+
+// 归一化 authMethod / provider 到后端接受的取值
+function canonAuthMethod(raw?: string): CredentialInput['authMethod'] | undefined {
+  if (!raw) return undefined
+  const v = raw.toLowerCase().replace(/[\s-]/g, '_')
+  if (v === 'api_key' || v === 'apikey' || v === 'kiro_api_key') return 'api_key'
+  if (v === 'idc' || v === 'iam' || v === 'sso') return 'idc'
+  if (v === 'builderid' || v === 'builder_id' || v === 'aws_builder_id') return 'builderid'
+  if (v === 'enterprise') return 'enterprise'
+  if (v === 'social' || v === 'google' || v === 'github' || v === 'oauth') return 'social'
+  return undefined
+}
+
 // 把单条 JSON 项归一化为 CredentialInput
 // 支持：
 //   1. 通用格式：{ refreshToken, clientId, ... } 或 { kiroApiKey }
 //   2. KAM 旧格式：{ email, credentials: { refreshToken, clientId, ... }, machineId, status }
 //   3. KAM 新格式（1.8.3+）：{ email, refreshToken, ... } 平铺
+//   4. 提取器格式（type=kiro_personal）：{ apiKey, accessToken, refreshToken, clientId,
+//      clientSecret, authMethod, provider, profileArn, plan, credits_*, ... } 平铺，
+//      字段名允许 snake_case 别名
 function normalizeItem(item: unknown): CredentialInput | null {
   if (typeof item !== 'object' || item === null) return null
   const obj = item as Record<string, unknown>
 
-  const str = (v: unknown): string | undefined =>
-    typeof v === 'string' && v.length > 0 ? v : undefined
-  const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined)
+  // KAM 旧格式：credentials 嵌套。把嵌套字段抬到顶层后走统一逻辑
+  const nested =
+    typeof obj.credentials === 'object' && obj.credentials !== null
+      ? (obj.credentials as Record<string, unknown>)
+      : null
+  const flat: Record<string, unknown> = nested ? { ...obj, ...nested } : obj
 
-  // KAM 旧格式：credentials 嵌套
-  if (typeof obj.credentials === 'object' && obj.credentials !== null) {
-    const cred = obj.credentials as Record<string, unknown>
-    const refreshToken = str(cred.refreshToken)
-    if (!refreshToken) return null
-    return {
-      refreshToken,
-      clientId: str(cred.clientId),
-      clientSecret: str(cred.clientSecret),
-      region: str(cred.region),
-      authMethod: str(cred.authMethod),
-      machineId: str(obj.machineId),
-      proxyUrl: str(obj.proxyUrl),
-      proxyUsername: str(obj.proxyUsername),
-      proxyPassword: str(obj.proxyPassword),
-      email: str(obj.email),
-      password: str(obj.password),
-      nickname: str(obj.nickname) || str(obj.label),
-      status: str(obj.status),
-    }
-  }
+  const refreshToken = pickStr(flat, 'refreshToken', 'refresh_token')
+  const apiKey = pickStr(flat, 'kiroApiKey', 'kiro_api_key', 'apiKey', 'api_key')
+  const clientId = pickStr(flat, 'clientId', 'client_id')
+  const clientSecret = pickStr(flat, 'clientSecret', 'client_secret')
 
-  // 通用 / KAM 平铺
-  // provider 字段映射为 authMethod: Enterprise → enterprise, BuilderId → builderid, Google/Social → social
-  const provider = str(obj.provider)
-  let authMethod = str(obj.authMethod)
-  if (!authMethod && provider) {
-    const p = provider.toLowerCase()
-    if (p === 'enterprise') {
-      authMethod = 'enterprise'
-    } else if (p === 'builderid') {
-      authMethod = 'builderid'
-    } else if (p === 'idc') {
-      authMethod = 'idc'
-    } else if (p === 'google' || p === 'social') {
-      authMethod = 'social'
-    } else if (p === 'api_key' || p === 'apikey') {
-      authMethod = 'api_key'
-    }
+  const explicitAuthMethod = canonAuthMethod(pickStr(flat, 'authMethod', 'auth_method'))
+  // provider 仅在没有显式 authMethod 时作为回退：Enterprise → enterprise,
+  // BuilderId → builderid, Google/GitHub → social
+  const declared = explicitAuthMethod ?? canonAuthMethod(pickStr(flat, 'provider'))
+  const hasOidcClient = !!(clientId && clientSecret)
+
+  // 决定走 OAuth 还是 API Key。
+  // 有些导出（如 type=kiro_personal）同时带 refreshToken 和 ksk_ 开头的 apiKey：
+  // 后端只要看到 kiroApiKey 就会把整条凭据当作不可刷新的 API Key 模式，
+  // 所以这里优先用 refreshToken，仅在显式 api_key 或没有 refreshToken 时才用 apiKey。
+  const useApiKey = !!apiKey && (declared === 'api_key' || !refreshToken)
+
+  let authMethod: CredentialInput['authMethod']
+  if (useApiKey) {
+    authMethod = 'api_key'
+  } else if (explicitAuthMethod && explicitAuthMethod !== 'api_key') {
+    // 显式声明优先；client 凭据缺失等问题留到导入阶段给出明确报错
+    authMethod = explicitAuthMethod
+  } else if (!hasOidcClient) {
+    // 没有完整 OIDC 客户端凭据时只能走 social 刷新端点，
+    // 避免由 provider 推断出必然刷新失败的 idc/builderid
+    authMethod = 'social'
+  } else {
+    // 有完整 client 凭据：沿用 provider 推断出的 OIDC 家族，否则按 idc
+    authMethod = declared === 'builderid' || declared === 'enterprise' ? declared : 'idc'
   }
 
   return {
-    refreshToken: str(obj.refreshToken),
-    clientId: str(obj.clientId),
-    clientSecret: str(obj.clientSecret),
-    region: str(obj.region),
-    authRegion: str(obj.authRegion),
-    apiRegion: str(obj.apiRegion),
-    priority: num(obj.priority),
-    machineId: str(obj.machineId),
-    kiroApiKey: str(obj.kiroApiKey),
+    refreshToken: useApiKey ? undefined : refreshToken,
+    clientId: useApiKey ? undefined : clientId,
+    clientSecret: useApiKey ? undefined : clientSecret,
+    profileArn: pickStr(flat, 'profileArn', 'profile_arn'),
+    region: pickStr(flat, 'region'),
+    authRegion: pickStr(flat, 'authRegion', 'auth_region'),
+    apiRegion: pickStr(flat, 'apiRegion', 'api_region'),
+    priority: pickNum(flat, 'priority'),
+    machineId: pickStr(flat, 'machineId', 'machine_id'),
+    kiroApiKey: useApiKey ? apiKey : undefined,
     authMethod,
-    endpoint: str(obj.endpoint),
-    proxyUrl: str(obj.proxyUrl),
-    proxyUsername: str(obj.proxyUsername),
-    proxyPassword: str(obj.proxyPassword),
-    email: str(obj.email),
-    password: str(obj.password),
-    nickname: str(obj.nickname) || str(obj.label),
-    status: str(obj.status),
+    endpoint: pickStr(flat, 'endpoint'),
+    proxyUrl: pickStr(flat, 'proxyUrl', 'proxy_url'),
+    proxyUsername: pickStr(flat, 'proxyUsername', 'proxy_username'),
+    proxyPassword: pickStr(flat, 'proxyPassword', 'proxy_password'),
+    email: pickStr(flat, 'email'),
+    password: pickStr(flat, 'password'),
+    nickname: pickStr(flat, 'nickname', 'label', 'name'),
+    status: pickStr(flat, 'status', 'accountStatus', 'account_status'),
   }
+}
+
+// 解析根节点为原始条目数组
+// 支持：数组、单对象、{ accounts | credentials | data | items: [...] } 包裹
+function rootToItems(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed
+  if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>
+    for (const key of ['accounts', 'credentials', 'data', 'items']) {
+      if (Array.isArray(obj[key])) return obj[key] as unknown[]
+    }
+    return [parsed]
+  }
+  throw new Error('JSON 根必须是对象、数组或 { accounts: [...] }')
+}
+
+// 逐条解析多个并列/换行分隔的 JSON 对象（JSONL 或直接首尾相接粘贴）
+// 通过括号配对切分，字符串内的括号与转义会被跳过
+function splitConcatenatedJson(raw: string): unknown[] {
+  const items: unknown[] = []
+  let depth = 0
+  let start = -1
+  let inString = false
+  let escaped = false
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+    } else if (ch === '{' || ch === '[') {
+      if (depth === 0) start = i
+      depth++
+    } else if (ch === '}' || ch === ']') {
+      depth--
+      if (depth === 0 && start >= 0) {
+        items.push(JSON.parse(raw.slice(start, i + 1)))
+        start = -1
+      } else if (depth < 0) {
+        throw new Error('括号不匹配')
+      }
+    }
+  }
+
+  if (depth !== 0) throw new Error('JSON 不完整')
+  if (items.length === 0) throw new Error('未找到 JSON 对象')
+  return items
 }
 
 // 解析输入 JSON，归一化为 CredentialInput[]
 function parseInput(raw: string): CredentialInput[] {
-  const parsed = JSON.parse(raw)
-
-  // KAM 标准格式 { version, accounts: [...] }
   let rawItems: unknown[]
-  if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { accounts?: unknown[] }).accounts)) {
-    rawItems = (parsed as { accounts: unknown[] }).accounts
-  } else if (Array.isArray(parsed)) {
-    rawItems = parsed
-  } else if (parsed && typeof parsed === 'object') {
-    rawItems = [parsed]
-  } else {
-    throw new Error('JSON 根必须是对象、数组或 { accounts: [...] }')
+  try {
+    rawItems = rootToItems(JSON.parse(raw))
+  } catch (e) {
+    // 整体解析失败时，尝试按并列 JSON 对象（JSONL / 多段粘贴）切分
+    try {
+      rawItems = splitConcatenatedJson(raw).flatMap((p) => rootToItems(p))
+    } catch {
+      throw e
+    }
   }
 
   const result: CredentialInput[] = []
@@ -288,7 +373,7 @@ export function BatchImportDialog({ open, onOpenChange, onBalanceUpdate }: Batch
           continue
         }
 
-        const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const isApiKeyCred = cred.authMethod === 'api_key' || !!cred.kiroApiKey
 
         let credHash = ''
         if (isApiKeyCred) {
@@ -364,52 +449,46 @@ export function BatchImportDialog({ open, onOpenChange, onBalanceUpdate }: Batch
         try {
           let addedCred: { credentialId: number; email?: string; balance?: import('@/types/api').BalanceResponse }
 
+          // normalizeItem 已完成 trim 与字段归一化，这里只做分支与必填校验
+          const common = {
+            priority: cred.priority || 0,
+            authRegion: cred.authRegion || cred.region,
+            apiRegion: cred.apiRegion,
+            machineId: cred.machineId,
+            endpoint: cred.endpoint,
+            proxyUrl: cred.proxyUrl,
+            proxyUsername: cred.proxyUsername,
+            proxyPassword: cred.proxyPassword,
+            email: cred.email,
+            password: cred.password,
+            autoAllocateProxy,
+          }
+
           if (isApiKeyCred) {
             addedCred = await addCredential({
+              ...common,
               authMethod: 'api_key',
-              kiroApiKey: cred.kiroApiKey?.trim(),
-              priority: cred.priority || 0,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
-              machineId: cred.machineId?.trim() || undefined,
-              endpoint: cred.endpoint?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
-              email: cred.email?.trim() || undefined,
-              password: cred.password?.trim() || undefined,
-              autoAllocateProxy,
+              kiroApiKey: cred.kiroApiKey,
             })
           } else {
-            const token = cred.refreshToken!.trim()
-            const clientId = cred.clientId?.trim() || undefined
-            const clientSecret = cred.clientSecret?.trim() || undefined
-            const authMethod = cred.authMethod === 'enterprise' ? 'enterprise'
-              : cred.authMethod === 'builderid' ? 'builderid'
-              : cred.authMethod === 'idc' ? 'idc'
-              : cred.authMethod === 'social' ? 'social'
-              : (clientId && clientSecret) ? 'idc' : 'social'
+            // normalizeItem 保证这里不会是 api_key
+            const authMethod = cred.authMethod as Exclude<typeof cred.authMethod, 'api_key'>
 
-            if (authMethod === 'social' && (clientId || clientSecret)) {
+            // idc / enterprise / builderid 走 OIDC 刷新，必须同时有 clientId 和 clientSecret
+            if (authMethod !== 'social' && !(cred.clientId && cred.clientSecret)) {
+              throw new Error(`${authMethod} 模式需要同时提供 clientId 和 clientSecret`)
+            }
+            if (authMethod === 'social' && (cred.clientId || cred.clientSecret)) {
               throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
             }
 
             addedCred = await addCredential({
-              refreshToken: token,
+              ...common,
+              refreshToken: cred.refreshToken,
               authMethod,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
-              clientId,
-              clientSecret,
-              priority: cred.priority || 0,
-              machineId: cred.machineId?.trim() || undefined,
-              endpoint: cred.endpoint?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
-              email: cred.email?.trim() || undefined,
-              password: cred.password?.trim() || undefined,
-              autoAllocateProxy,
+              clientId: cred.clientId,
+              clientSecret: cred.clientSecret,
+              profileArn: cred.profileArn,
             })
           }
 
@@ -566,7 +645,7 @@ export function BatchImportDialog({ open, onOpenChange, onBalanceUpdate }: Batch
           <div className="space-y-2">
             <label className="text-sm font-medium">JSON 凭据</label>
             <textarea
-              placeholder={'粘贴 JSON 凭据，支持以下格式：\n\n1) 通用格式（数组或单对象）\nOAuth: [{"refreshToken":"...", "authMethod":"social|idc", "clientId":"...", "clientSecret":"...", "authRegion":"...", "apiRegion":"...", "priority":0, "machineId":"...", "endpoint":"...", "email":"...", "password":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx", "endpoint":"...", "email":"...", "password":"...", "proxyUrl":"..."}]\n\n2) KAM 旧版导出（嵌套）\n{"version":"1.5.0", "accounts":[{"email":"...", "password":"...", "credentials":{"refreshToken":"...", "clientId":"...", "clientSecret":"...", "region":"...", "authMethod":"..."}, "machineId":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]}\n\n3) KAM 1.8.3+ 导出（平铺）\n[{"email":"...", "password":"...", "refreshToken":"...", "clientId":"...", "clientSecret":"...", "region":"...", "authRegion":"...", "apiRegion":"...", "machineId":"...", "endpoint":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]\n\n所有字段除 refreshToken/kiroApiKey 外均为可选'}
+              placeholder={'粘贴 JSON 凭据，支持以下格式：\n\n1) 通用格式（数组或单对象）\nOAuth: [{"refreshToken":"...", "authMethod":"social|idc", "clientId":"...", "clientSecret":"...", "authRegion":"...", "apiRegion":"...", "priority":0, "machineId":"...", "endpoint":"...", "email":"...", "password":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx", "endpoint":"...", "email":"...", "password":"...", "proxyUrl":"..."}]\n\n2) KAM 旧版导出（嵌套）\n{"version":"1.5.0", "accounts":[{"email":"...", "password":"...", "credentials":{"refreshToken":"...", "clientId":"...", "clientSecret":"...", "region":"...", "authMethod":"..."}, "machineId":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]}\n\n3) KAM 1.8.3+ 导出（平铺）\n[{"email":"...", "password":"...", "refreshToken":"...", "clientId":"...", "clientSecret":"...", "region":"...", "authRegion":"...", "apiRegion":"...", "machineId":"...", "endpoint":"...", "proxyUrl":"...", "proxyUsername":"...", "proxyPassword":"..."}]\n\n4) 提取器导出（type=kiro_personal，可直接整段粘贴，多条可换行并列）\n{"accessToken":"...", "apiKey":"ksk_xxx", "authMethod":"idc", "clientId":"...", "clientSecret":"...", "email":"...", "plan":"KIRO PRO MAX", "profileArn":"", "provider":"BuilderId", "refreshToken":"...", "type":"kiro_personal"}\n\n字段名兼容 snake_case（refresh_token / client_id / profile_arn ...）\n同时带 refreshToken 和 apiKey 时优先按 OAuth 导入（可刷新）\n所有字段除 refreshToken/kiroApiKey(apiKey) 外均为可选'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
