@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -27,10 +28,8 @@ use crate::model::config::Config;
 
 /// 用量类 REST 接口（getUsageLimits / setUserPreference）固定使用的 Kiro IDE 版本。
 ///
-/// 上游按 User-Agent 中的 Kiro 版本号决定是否强制要求 `profileArn`：新版 IDE
-/// 对这些接口强制要求，导致个人 BuilderID / Enterprise / IdC 账号收到
-/// `400 {"message":"Invalid profileArn."}`。该版本无需 profileArn 即可返回
-/// 订阅与用量数据。
+/// 该版本号只影响 User-Agent。Enterprise / IdC 账号调用这些接口仍需发送真实
+/// `profileArn`；BuilderID 占位 ARN 则不能发送。
 ///
 /// 流式端点 `generateAssistantResponse` 不受影响，仍使用 `config.kiro_version`。
 pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
@@ -331,6 +330,59 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// Kiro 用量类 REST 接口仅在 us-east-1 和 eu-central-1 提供服务。
+/// 按 SSO 区域优先选择端点，并将另一区域作为 Enterprise/IdC 的 403 回退。
+fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
+    if sso_region == "eu-central-1" || sso_region.starts_with("eu-") {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    profile_arn
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default()
+}
+
+/// 先携带真实 ARN，再保留不带 ARN 的兼容请求，最后回退到另一区域。
+/// BuilderID 占位 ARN 会被 `effective_profile_arn` 过滤。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
+}
+
+fn set_user_preference_body(
+    credentials: &KiroCredentials,
+    overage_status: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "overageConfiguration": { "overageStatus": overage_status }
+    });
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        body["profileArn"] = serde_json::json!(profile_arn);
+    }
+    body
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -340,28 +392,13 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定使用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对个人 BuilderID / Enterprise / IdC 账号会返回
-    // 400 {"message":"Invalid profileArn."}；该版本无需 profileArn。
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 构建 URL
-    //
-    // 注意：这里刻意不拼接 profileArn。Kiro 0.9.2 的该接口不接受该参数，
-    // 即使凭据持有真实 ARN，带上也会让请求 malformed。profileArn 只用于
-    // 流式端点 generateAssistantResponse。
-    let url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    );
-
-    // 构建 User-Agent headers
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
@@ -370,28 +407,44 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         kiro_version, machine_id
     );
-
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let attempts = usage_api_attempts(credentials, &candidates);
+    let mut last_error: Option<String> = None;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = usage_limits_url(&host, *profile_arn);
+        let mut request = client
+            .get(&url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let response = request.send().await?;
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await?);
+        }
 
-    let status = response.status();
-    if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+            tracing::debug!(
+                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
+                region,
+                profile_arn.is_some()
+            );
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -402,8 +455,85 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
-    Ok(data)
+    bail!(
+        "权限不足，无法获取使用额度: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
+}
+
+/// 查询 Enterprise 和 IdC 凭据的真实 profile ARN。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        kiro_version, machine_id
+    );
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut last_error: Option<String> = None;
+    let mut empty_seen = false;
+
+    for region in candidates {
+        let host = format!("q.{}.amazonaws.com", region);
+        let mut request = client
+            .post(format!("https://{}/", host))
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .body(r#"{"maxResults":10}"#);
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            let data: ListAvailableProfilesResponse = response.json().await?;
+            if data.first_arn().is_some() {
+                return Ok(data);
+            }
+            empty_seen = true;
+            continue;
+        }
+
+        last_error = Some(format!(
+            "{} {}",
+            status,
+            response.text().await.unwrap_or_default()
+        ));
+    }
+
+    if empty_seen {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
+    bail!(
+        "获取可用 profile 失败: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 /// 调用 setUserPreference 设置超额开关
@@ -414,16 +544,12 @@ pub(crate) async fn set_user_preference(
     proxy: Option<&ProxyConfig>,
     overage_status: &str,
 ) -> anyhow::Result<()> {
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 同 getUsageLimits：用量类 REST 接口固定用旧版本，避免上游强制要求 profileArn
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
-
-    let url = format!("https://{}/setUserPreference", host);
-
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
@@ -432,42 +558,52 @@ pub(crate) async fn set_user_preference(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         kiro_version, machine_id
     );
-
-    let mut body = serde_json::json!({
-        "overageConfiguration": { "overageStatus": overage_status }
-    });
-    // 用量类接口只带真实 ARN：BuilderID 占位符会让上游返回 400 Invalid profileArn.
-    if let Some(profile_arn) = credentials.effective_profile_arn() {
-        body["profileArn"] = serde_json::json!(profile_arn);
-    }
-
     let client = build_client(proxy, 30, config.tls_backend)?;
+    let body = set_user_preference_body(credentials, overage_status);
+    let mut last_error: Option<String> = None;
 
-    let mut request = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close")
-        .json(&body);
+    for (idx, region) in candidates.iter().enumerate() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let mut request = client
+            .post(format!("https://{}/setUserPreference", host))
+            .header("content-type", "application/json")
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .json(&body);
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let response = request.send().await?;
-    let status = response.status();
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
 
-    if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+            tracing::debug!(
+                "setUserPreference 在 {} 返回 403，尝试备用端点 {}",
+                region,
+                candidates[idx + 1]
+            );
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         bail!("setUserPreference 失败: {} {}", status, body_text);
     }
 
-    Ok(())
+    bail!(
+        "setUserPreference 失败: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 // ============================================================================
@@ -2068,6 +2204,52 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 解析并持久化 Enterprise/IdC 的真实 profile ARN。
+    /// BuilderID 凭据无真实 ARN 时保留 `None` 回退路径。
+    pub async fn resolve_profile_arn_for(
+        &self,
+        id: u64,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            return Ok(None);
+        }
+
+        if let Some(arn) = credentials.effective_profile_arn() {
+            return Ok(Some(arn.to_string()));
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let profiles =
+            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+                .await?;
+        let Some(arn) = profiles.first_arn().map(str::to_owned) else {
+            return Ok(None);
+        };
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.credentials.profile_arn = Some(arn.clone());
+            }
+        }
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", error);
+        }
+        tracing::info!("凭据 #{} 已解析并回填真实 profileArn", id);
+
+        Ok(Some(arn))
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -2082,7 +2264,7 @@ impl MultiTokenManager {
         let ctx = self.try_ensure_token(id, &credentials).await?;
         let token = ctx.token;
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -2090,6 +2272,14 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询用量前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
@@ -2175,10 +2365,18 @@ impl MultiTokenManager {
         };
 
         // 重新获取凭据（token 刷新后可能变化）
-        let credentials = match self.entries.lock().iter().find(|e| e.id == id).map(|e| e.credentials.clone()) {
+        let mut credentials = match self.entries.lock().iter().find(|e| e.id == id).map(|e| e.credentials.clone()) {
             Some(c) => c,
             None => return OverageResult { id, status: "error".into(), message: "凭据不存在".into() },
         };
+
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置超额前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
 
@@ -3786,5 +3984,87 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[test]
+    fn usage_rest_urls_carry_real_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let arn = credentials.effective_profile_arn();
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, arn),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+        );
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", arn),
+                ("us-east-1", None),
+                ("eu-central-1", arn),
+                ("eu-central-1", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_rest_attempts_skip_builder_id_placeholder() {
+        use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+        let credentials = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(credentials.effective_profile_arn(), None);
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![("us-east-1", None), ("eu-central-1", None)]
+        );
+    }
+
+    #[test]
+    fn usage_rest_region_candidates_follow_sso_region() {
+        assert_eq!(
+            rest_api_region_candidates("eu-west-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("ap-southeast-1"),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn set_user_preference_body_uses_only_real_profile_arn() {
+        use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+        let real = KiroCredentials {
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_user_preference_body(&real, "ENABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/REAL",
+            })
+        );
+
+        let builder = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_user_preference_body(&builder, "DISABLED"),
+            serde_json::json!({
+                "overageConfiguration": { "overageStatus": "DISABLED" },
+            })
+        );
     }
 }

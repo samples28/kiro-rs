@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -43,6 +44,12 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 已确认不存在真实 profileArn 的凭据身份。
+    ///
+    /// 纯 BuilderID 凭据没有可用的 Enterprise profile；缓存其空结果，避免每次
+    /// 聊天或 MCP 请求都重复调用 ListAvailableProfiles。缓存键包含 refreshToken
+    /// 指纹，避免删除最大 ID 后新增凭据复用该 ID 时继承旧的空结果。
+    profile_resolution_attempted: Mutex<HashSet<ProfileResolutionCacheKey>>,
 }
 
 impl KiroProvider {
@@ -78,6 +85,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -113,6 +121,42 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    /// 将 Enterprise / IdC 账号的真实 profileArn 写入本次请求上下文。
+    ///
+    /// generateAssistantResponse 和 MCP 都会校验 profileArn；缺失或使用 BuilderID
+    /// 占位符时，Enterprise / IdC token 会被上游拒绝。查询失败不阻断本次请求，
+    /// 这样 BuilderID 及临时网络错误仍沿用既有兼容路径。
+    async fn ensure_profile_arn(&self, ctx: &mut CallContext) {
+        if !needs_profile_arn_resolution(&ctx.credentials) {
+            return;
+        }
+
+        let cache_key = profile_resolution_cache_key(ctx.id, &ctx.credentials);
+        if self.profile_resolution_attempted.lock().contains(&cache_key) {
+            return;
+        }
+
+        match self
+            .token_manager
+            .resolve_profile_arn_for(ctx.id, &ctx.token)
+            .await
+        {
+            Ok(Some(arn)) => {
+                ctx.credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {
+                self.profile_resolution_attempted.lock().insert(cache_key);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "凭据 #{} 解析真实 profileArn 失败（按现有 profileArn 继续）: {}",
+                    ctx.id,
+                    error
+                );
+            }
+        }
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
@@ -141,13 +185,15 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -301,13 +347,15 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -532,5 +580,101 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+fn needs_profile_arn_resolution(credentials: &KiroCredentials) -> bool {
+    use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+    if credentials.is_api_key_credential() {
+        return false;
+    }
+
+    match credentials.profile_arn.as_deref().map(str::trim) {
+        None | Some("") => true,
+        Some(arn) => is_placeholder_profile_arn(arn),
+    }
+}
+
+type ProfileResolutionCacheKey = (u64, String);
+
+/// 用稳定的 refreshToken 指纹区分同一数值 ID 的不同 OAuth 凭据。
+///
+/// `add_credential` 按当前最大 ID + 1 分配 ID，因此删除最大 ID 后可能复用该值。
+/// 不能让新凭据命中旧 BuilderID 的“无 profile”缓存。
+fn profile_resolution_cache_key(
+    id: u64,
+    credentials: &KiroCredentials,
+) -> ProfileResolutionCacheKey {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        credentials
+            .refresh_token
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    (id, format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{needs_profile_arn_resolution, profile_resolution_cache_key};
+    use crate::kiro::model::credentials::{KiroCredentials, BUILDER_ID_PROFILE_ARN};
+
+    #[test]
+    fn unresolved_profile_arn_is_resolved_only_for_oauth_credentials() {
+        assert!(needs_profile_arn_resolution(&KiroCredentials::default()));
+
+        let blank = KiroCredentials {
+            profile_arn: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(needs_profile_arn_resolution(&blank));
+
+        let builder = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        assert!(needs_profile_arn_resolution(&builder));
+
+        let real = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(!needs_profile_arn_resolution(&real));
+
+        let api_key = KiroCredentials {
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        assert!(!needs_profile_arn_resolution(&api_key));
+    }
+
+    #[test]
+    fn profile_resolution_cache_key_does_not_cross_reused_credential_id() {
+        let first = KiroCredentials {
+            refresh_token: Some("first-refresh-token".to_string()),
+            ..Default::default()
+        };
+        let replacement = KiroCredentials {
+            refresh_token: Some("replacement-refresh-token".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            profile_resolution_cache_key(7, &first),
+            profile_resolution_cache_key(7, &first)
+        );
+        assert_ne!(
+            profile_resolution_cache_key(7, &first),
+            profile_resolution_cache_key(7, &replacement)
+        );
+        assert_ne!(
+            profile_resolution_cache_key(7, &first),
+            profile_resolution_cache_key(8, &first)
+        );
     }
 }

@@ -351,8 +351,8 @@ impl KiroCredentials {
     ///
     /// 新版上游对流式端点强制要求 `profileArn`，缺失会返回
     /// `400 {"message":"profileArn is required for this request."}`。Enterprise / IdC
-    /// 账号的真实 ARN 由 Token 刷新流程回填（见 `refresh_idc_token`）；纯 BuilderID
-    /// 账号没有可解析的真实 profile，按官方 IDE 行为发送 BuilderID 占位符。
+    /// 账号的真实 ARN 由 `ListAvailableProfiles` 按需解析并回填；纯 BuilderID 账号
+    /// 没有可解析的真实 profile，按官方 IDE 行为发送 BuilderID 占位符。
     ///
     /// - 已有显式 profileArn（真实 ARN / Social ARN / 占位符）→ 原样返回；
     /// - 尚未填充 → 按登录方式推断（Social → Social ARN，其余 → BuilderID 占位符）；
