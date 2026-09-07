@@ -21,6 +21,8 @@ pub enum PollResult {
     Pending,
     /// 上游要求降低轮询频率。
     SlowDown,
+    /// 网络或上游暂时不可用，保留设备授权并延迟重试。
+    Retry { retry_after: Option<u64> },
     /// 授权成功，返回 token
     Success(CreateTokenResponse),
     /// 设备码已过期，需重新发起
@@ -153,19 +155,35 @@ pub async fn poll_token(
         device_code: device_code.to_string(),
     };
 
+    poll_token_request(&client, &url, &body).await
+}
+
+async fn poll_token_request(
+    client: &reqwest::Client,
+    url: &str,
+    body: &CreateTokenRequest,
+) -> PollResult {
     let resp = match client
-        .post(&url)
+        .post(url)
         .header("content-type", "application/json")
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .json(&body)
+        .json(body)
         .send()
         .await
     {
         Ok(r) => r,
-        Err(e) => return PollResult::Error(e.into()),
+        Err(_) => return PollResult::Retry { retry_after: None },
     };
 
     let status = resp.status();
+
+    if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
+        return PollResult::Retry { retry_after };
+    }
 
     if status.is_success() {
         return match resp.json::<CreateTokenResponse>().await {
@@ -176,7 +194,7 @@ pub async fn poll_token(
 
     let body_text = match resp.text().await {
         Ok(t) => t,
-        Err(e) => return PollResult::Error(e.into()),
+        Err(_) => return PollResult::Retry { retry_after: None },
     };
 
     // 解析标准 OIDC 错误码
@@ -184,6 +202,9 @@ pub async fn poll_token(
         match err_resp.error.as_str() {
             "authorization_pending" => return PollResult::Pending,
             "slow_down" => return PollResult::SlowDown,
+            "server_error" | "temporarily_unavailable" => {
+                return PollResult::Retry { retry_after: None };
+            }
             "expired_token" => return PollResult::Expired,
             "access_denied" => return PollResult::Error(anyhow::anyhow!("用户拒绝了授权请求")),
             _ => {}
@@ -191,4 +212,116 @@ pub async fn poll_token(
     }
 
     PollResult::Error(anyhow::anyhow!("轮询令牌失败 {}: {}", status, body_text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> CreateTokenRequest {
+        CreateTokenRequest {
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code".into(),
+            device_code: "device".into(),
+        }
+    }
+
+    async fn mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, extract::Path, http::StatusCode, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/status/{status}",
+                post(|Path(status): Path<u16>| async move {
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [("retry-after", "90")],
+                        "temporary upstream failure",
+                    )
+                }),
+            )
+            .route(
+                "/error/{error}",
+                post(|Path(error): Path<String>| async move {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error":error})),
+                    )
+                }),
+            )
+            .route(
+                "/timeout",
+                post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    "too late"
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn transient_http_errors_do_not_end_device_authorization() {
+        let (base, server) = mock_server().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for status in [408, 429, 500, 502, 503, 504] {
+            let result =
+                poll_token_request(&client, &format!("{base}/status/{status}"), &request()).await;
+            assert!(
+                matches!(
+                    result,
+                    PollResult::Retry {
+                        retry_after: Some(90)
+                    }
+                ),
+                "HTTP {status} did not respect retry-after: {result:?}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_does_not_end_device_authorization() {
+        let (base, server) = mock_server().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let result = poll_token_request(&client, &format!("{base}/timeout"), &request()).await;
+        server.abort();
+        assert!(
+            matches!(result, PollResult::Retry { retry_after: None }),
+            "transport timeout discarded the login session: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_authorization_responses_keep_their_meaning() {
+        let (base, server) = mock_server().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let pending = poll_token_request(
+            &client,
+            &format!("{base}/error/authorization_pending"),
+            &request(),
+        )
+        .await;
+        assert!(matches!(pending, PollResult::Pending));
+        let slower =
+            poll_token_request(&client, &format!("{base}/error/slow_down"), &request()).await;
+        assert!(matches!(slower, PollResult::SlowDown));
+        let expired =
+            poll_token_request(&client, &format!("{base}/error/expired_token"), &request()).await;
+        assert!(matches!(expired, PollResult::Expired));
+        for error in ["access_denied", "invalid_client"] {
+            let result =
+                poll_token_request(&client, &format!("{base}/error/{error}"), &request()).await;
+            assert!(matches!(result, PollResult::Error(_)));
+        }
+        server.abort();
+    }
 }

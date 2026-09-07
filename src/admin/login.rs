@@ -1,9 +1,9 @@
 //! 管理后台交互式登录：移植自 kiro.rs 的 Portal PKCE / AWS OIDC 流程。
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use super::{AdminService, AdminServiceError};
 use crate::{
@@ -23,7 +23,8 @@ pub(super) struct LoginSessions(Arc<Mutex<HashMap<String, Arc<LoginSession>>>>);
 
 struct LoginSession {
     expires_at: DateTime<Utc>,
-    state: AsyncMutex<LoginState>,
+    state: Arc<AsyncMutex<LoginState>>,
+    cancelled: watch::Sender<bool>,
 }
 
 enum LoginState {
@@ -62,7 +63,8 @@ impl LoginSessions {
             id.clone(),
             Arc::new(LoginSession {
                 expires_at,
-                state: AsyncMutex::new(state),
+                state: Arc::new(AsyncMutex::new(state)),
+                cancelled: watch::channel(false).0,
             }),
         );
         // 无浏览器轮询时也会清理 verifier、clientSecret 和本地监听端口。
@@ -72,7 +74,12 @@ impl LoginSessions {
             let delay = (expires_at - Utc::now()).to_std().unwrap_or_default();
             tokio::time::sleep(delay).await;
             if let Some(sessions) = sessions.upgrade() {
-                sessions.lock().remove(&cleanup_id);
+                // 授权截止时只移除等待中的会话；已开始保存的任务与结果保留一段时间。
+                LoginSessions(sessions).get(&cleanup_id);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            if let Some(sessions) = sessions.upgrade() {
+                LoginSessions(sessions).cancel(&cleanup_id);
             }
         });
         id
@@ -80,12 +87,52 @@ impl LoginSessions {
 
     fn get(&self, id: &str) -> Option<Arc<LoginSession>> {
         let mut sessions = self.0.lock();
-        if sessions.get(id).is_some_and(|s| Utc::now() >= s.expires_at) {
+        let session = sessions.get(id)?.clone();
+        let waiting_expired = Utc::now() >= session.expires_at
+            && session.state.try_lock().is_ok_and(|state| {
+                matches!(
+                    *state,
+                    LoginState::Social(_) | LoginState::Idc(_) | LoginState::Expired
+                )
+            });
+        if waiting_expired {
+            session.cancelled.send_replace(true);
             sessions.remove(id);
             return None;
         }
-        sessions.get(id).cloned()
+        Some(session)
     }
+
+    fn cancel(&self, id: &str) {
+        if let Some(session) = self.0.lock().remove(id) {
+            session.cancelled.send_replace(true);
+        }
+    }
+}
+
+/// HTTP 连接断开不取消授权码兑换；明确取消会话则中止尚未提交的工作。
+async fn run_login_job(
+    session: Arc<LoginSession>,
+    work: impl Future<Output = Result<PollIdcLoginResponse, AdminServiceError>> + Send + 'static,
+) -> Result<PollIdcLoginResponse, AdminServiceError> {
+    tokio::spawn(async move {
+        let mut cancelled = session.cancelled.subscribe();
+        let response = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|cancelled| *cancelled) => Ok(PollIdcLoginResponse::Expired),
+            result = work => result,
+        };
+        if let Ok(PollIdcLoginResponse::Pending { poll_interval }) = response {
+            // 上游的等待间隔可以很长，但前端仍应及时取得会话过期状态。
+            let remaining = (session.expires_at - Utc::now()).num_milliseconds().max(0);
+            let until_expiry = ((remaining + 999) / 1000).max(1) as u64;
+            Ok(pending(poll_interval.min(until_expiry)))
+        } else {
+            response
+        }
+    })
+    .await
+    .map_err(|e| AdminServiceError::InternalError(format!("登录任务失败: {e}")))?
 }
 
 fn pending(interval: u64) -> PollIdcLoginResponse {
@@ -138,6 +185,7 @@ impl AdminService {
         }
         let credentials = KiroCredentials {
             auth_method: Some("social".into()),
+            auth_region: Some("us-east-1".into()),
             priority: req.priority,
             email: req.email,
             proxy_url: req.proxy_url,
@@ -172,13 +220,13 @@ impl AdminService {
     }
 
     pub async fn poll_social_login(
-        &self,
+        self: &Arc<Self>,
         id: &str,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         let Some(session) = self.login_sessions.get(id) else {
             return Ok(PollIdcLoginResponse::Expired);
         };
-        let Ok(mut state) = session.state.try_lock() else {
+        let Ok(mut state) = session.state.clone().try_lock_owned() else {
             return Ok(pending(2));
         };
         let callback = match &mut *state {
@@ -192,11 +240,15 @@ impl AdminService {
             },
             _ => return terminal(&state),
         };
-        self.finish_social_login(&mut state, callback).await
+        let service = self.clone();
+        run_login_job(session, async move {
+            service.finish_social_login(&mut state, callback).await
+        })
+        .await
     }
 
     pub async fn complete_social_login(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         code: String,
         state: String,
@@ -206,18 +258,23 @@ impl AdminService {
         let Some(session) = self.login_sessions.get(id) else {
             return Ok(PollIdcLoginResponse::Expired);
         };
-        let Ok(mut session_state) = session.state.try_lock() else {
+        let Ok(mut session_state) = session.state.clone().try_lock_owned() else {
             return Ok(pending(2));
         };
-        self.finish_social_login(
-            &mut session_state,
-            social::OAuthCallbackData {
-                code,
-                state,
-                login_option,
-                path,
-            },
-        )
+        let service = self.clone();
+        run_login_job(session, async move {
+            service
+                .finish_social_login(
+                    &mut session_state,
+                    social::OAuthCallbackData {
+                        code,
+                        state,
+                        login_option,
+                        path,
+                    },
+                )
+                .await
+        })
         .await
     }
 
@@ -334,7 +391,8 @@ impl AdminService {
         credentials.client_id = Some(reg.client_id.clone());
         credentials.client_secret = Some(reg.client_secret.clone());
         let expires_at = Utc::now() + Duration::seconds(device.expires_in.clamp(1, 3600));
-        let interval = device.interval.clamp(5, 60) as u64;
+        // 不把上游要求的长间隔缩短；最多等待到会话的最长有效期。
+        let interval = device.interval.clamp(5, 3600) as u64;
         let session_id = self.login_sessions.insert(
             expires_at,
             LoginState::Idc(IdcSession {
@@ -359,16 +417,27 @@ impl AdminService {
     }
 
     pub async fn poll_idc_login(
-        &self,
+        self: &Arc<Self>,
         id: &str,
     ) -> Result<PollIdcLoginResponse, AdminServiceError> {
         let Some(session) = self.login_sessions.get(id) else {
             return Ok(PollIdcLoginResponse::Expired);
         };
-        let Ok(mut state) = session.state.try_lock() else {
+        let Ok(mut state) = session.state.clone().try_lock_owned() else {
             return Ok(pending(5));
         };
-        let LoginState::Idc(s) = &mut *state else {
+        let service = self.clone();
+        run_login_job(session, async move {
+            service.poll_idc_session(&mut state).await
+        })
+        .await
+    }
+
+    async fn poll_idc_session(
+        &self,
+        state: &mut LoginState,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        let LoginState::Idc(s) = state else {
             return terminal(&state);
         };
         if Utc::now() < s.next_poll {
@@ -383,11 +452,31 @@ impl AdminService {
             s.proxy.as_ref(),
         )
         .await;
+        self.finish_idc_poll(state, result).await
+    }
+
+    async fn finish_idc_poll(
+        &self,
+        state: &mut LoginState,
+        result: idc::PollResult,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        let LoginState::Idc(s) = state else {
+            return terminal(state);
+        };
         match result {
             idc::PollResult::Pending | idc::PollResult::SlowDown => {
                 if matches!(result, idc::PollResult::SlowDown) {
-                    s.interval = (s.interval + 5).min(60);
+                    s.interval = s.interval.saturating_add(5).min(3600);
                 }
+                s.next_poll = Utc::now() + Duration::seconds(s.interval as i64);
+                Ok(pending(s.interval))
+            }
+            idc::PollResult::Retry { retry_after } => {
+                s.interval = s
+                    .interval
+                    .saturating_mul(2)
+                    .max(retry_after.unwrap_or(0))
+                    .min(3600);
                 s.next_poll = Utc::now() + Duration::seconds(s.interval as i64);
                 Ok(pending(s.interval))
             }
@@ -396,7 +485,7 @@ impl AdminService {
                 Ok(PollIdcLoginResponse::Expired)
             }
             idc::PollResult::Error(e) => Self::record_login_result(
-                &mut state,
+                state,
                 Err(AdminServiceError::UpstreamError(e.to_string())),
             ),
             idc::PollResult::Success(token) => {
@@ -408,7 +497,7 @@ impl AdminService {
                     .and_then(|secs| Utc::now().checked_add_signed(Duration::try_seconds(secs)?))
                     .map(|time| time.to_rfc3339());
                 let result = self.save_login_credential(credentials).await;
-                Self::record_login_result(&mut state, result)
+                Self::record_login_result(state, result)
             }
         }
     }
@@ -432,35 +521,38 @@ impl AdminService {
     async fn save_login_credential(&self, cred: KiroCredentials) -> Result<u64, AdminServiceError> {
         // 复用本项目的验证、代理池分配、持久化、计费清理及余额获取路径。
         let response = self
-            .add_credential(AddCredentialRequest {
-                refresh_token: cred.refresh_token,
-                auth_method: cred.auth_method.unwrap_or_else(|| "social".into()),
-                profile_arn: cred.profile_arn,
-                client_id: cred.client_id,
-                client_secret: cred.client_secret,
-                priority: cred.priority,
-                region: cred.region,
-                auth_region: cred.auth_region,
-                api_region: cred.api_region,
-                machine_id: cred.machine_id,
-                email: cred.email,
-                password: None,
-                proxy_url: cred.proxy_url,
-                proxy_username: cred.proxy_username,
-                proxy_password: cred.proxy_password,
-                kiro_api_key: None,
-                endpoint: None,
-                cooldown_enabled: None,
-                cooldown_seconds: None,
-                cooldown_max_requests: None,
-                auto_allocate_proxy: true,
-            })
+            .add_credential_with_balance(
+                AddCredentialRequest {
+                    refresh_token: cred.refresh_token,
+                    auth_method: cred.auth_method.unwrap_or_else(|| "social".into()),
+                    profile_arn: cred.profile_arn,
+                    client_id: cred.client_id,
+                    client_secret: cred.client_secret,
+                    priority: cred.priority,
+                    region: cred.region,
+                    auth_region: cred.auth_region,
+                    api_region: cred.api_region,
+                    machine_id: cred.machine_id,
+                    email: cred.email,
+                    password: None,
+                    proxy_url: cred.proxy_url,
+                    proxy_username: cred.proxy_username,
+                    proxy_password: cred.proxy_password,
+                    kiro_api_key: None,
+                    endpoint: None,
+                    cooldown_enabled: None,
+                    cooldown_seconds: None,
+                    cooldown_max_requests: None,
+                    auto_allocate_proxy: true,
+                },
+                false,
+            )
             .await?;
         Ok(response.credential_id)
     }
 
     pub fn cancel_login(&self, id: &str) {
-        self.login_sessions.0.lock().remove(id);
+        self.login_sessions.cancel(id);
     }
 }
 
@@ -473,6 +565,211 @@ mod tests {
     fn service() -> AdminService {
         let manager = MultiTokenManager::new(Config::default(), vec![], None, None, true).unwrap();
         AdminService::new(Arc::new(manager), ["ide".to_string()])
+    }
+
+    fn device_session(interval: u64) -> LoginState {
+        LoginState::Idc(IdcSession {
+            region: "us-east-1".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            device_code: "device".into(),
+            interval,
+            next_poll: Utc::now(),
+            credentials: KiroCredentials::default(),
+            proxy: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn retry_delay_does_not_hide_session_expiration_from_the_browser() {
+        let service = service();
+        let id = service
+            .login_sessions
+            .insert(Utc::now() + Duration::seconds(10), device_session(3600));
+        let session = service.login_sessions.get(&id).unwrap();
+        let response = run_login_job(session, async { Ok(pending(3600)) })
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            PollIdcLoginResponse::Pending {
+                poll_interval: 1..=10
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_authorization_retries_keep_session_and_increase_poll_delay() {
+        let service = service();
+        let mut state = device_session(5);
+        let first = service
+            .finish_idc_poll(&mut state, idc::PollResult::Retry { retry_after: None })
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            PollIdcLoginResponse::Pending { poll_interval: 10 }
+        ));
+        let retry = service
+            .finish_idc_poll(
+                &mut state,
+                idc::PollResult::Retry {
+                    retry_after: Some(90),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            retry,
+            PollIdcLoginResponse::Pending { poll_interval: 90 }
+        ));
+        let LoginState::Idc(session) = &state else {
+            panic!("device authorization was discarded")
+        };
+        assert_eq!(session.device_code, "device");
+        assert!(session.next_poll > Utc::now() + Duration::seconds(89));
+        let response = service.poll_idc_session(&mut state).await.unwrap();
+        assert!(matches!(
+            response,
+            PollIdcLoginResponse::Pending { poll_interval: 90 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_authorization_slow_down_honors_intervals_over_sixty_seconds() {
+        let service = service();
+        let mut state = device_session(60);
+        let result = service
+            .finish_idc_poll(&mut state, idc::PollResult::SlowDown)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            PollIdcLoginResponse::Pending { poll_interval: 65 }
+        ));
+        let result = service
+            .finish_idc_poll(&mut state, idc::PollResult::Pending)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            PollIdcLoginResponse::Pending { poll_interval: 65 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_session_stops_work_before_credentials_are_committed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let service = Arc::new(service());
+        let id = service
+            .login_sessions
+            .insert(Utc::now() + Duration::minutes(1), LoginState::Expired);
+        let session = service.login_sessions.get(&id).unwrap();
+        let guard = session.state.clone().lock_owned().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let committed = Arc::new(AtomicBool::new(false));
+        let job = tokio::spawn(run_login_job(session.clone(), {
+            let started = started.clone();
+            let release = release.clone();
+            let committed = committed.clone();
+            async move {
+                let _guard = guard;
+                started.notify_one();
+                release.notified().await;
+                committed.store(true, Ordering::SeqCst);
+                Ok(PollIdcLoginResponse::Success { credential_id: 42 })
+            }
+        }));
+        started.notified().await;
+        service.cancel_login(&id);
+        assert!(matches!(
+            job.await.unwrap().unwrap(),
+            PollIdcLoginResponse::Expired
+        ));
+        release.notify_one();
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(session.state.try_lock().is_ok());
+        assert!(service.login_sessions.get(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnecting_http_request_does_not_lose_login_result() {
+        let service = Arc::new(service());
+        let start = service
+            .start_social_login(serde_json::from_value(json!({})).unwrap())
+            .await
+            .unwrap();
+        let session = service.login_sessions.get(&start.session_id).unwrap();
+        let mut state = session.state.clone().lock_owned().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        let request = tokio::spawn(run_login_job(session.clone(), {
+            let started = started.clone();
+            let release = release.clone();
+            let done = done.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                let result = AdminService::record_login_result(&mut state, Ok(42));
+                done.notify_one();
+                result
+            }
+        }));
+        started.notified().await;
+        assert!(matches!(
+            service.poll_social_login(&start.session_id).await.unwrap(),
+            PollIdcLoginResponse::Pending { .. }
+        ));
+        request.abort();
+        let _ = request.await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), done.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.poll_social_login(&start.session_id).await.unwrap(),
+            PollIdcLoginResponse::Success { credential_id: 42 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn saved_login_result_remains_available_after_authorization_deadline() {
+        let service = Arc::new(service());
+        let id = service
+            .login_sessions
+            .insert(Utc::now() - Duration::seconds(1), LoginState::Success(42));
+        assert!(matches!(
+            service.poll_social_login(&id).await.unwrap(),
+            PollIdcLoginResponse::Success { credential_id: 42 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn social_login_uses_its_own_auth_region_with_a_different_global_region() {
+        let mut config = Config::default();
+        config.region = "eu-west-1".into();
+        config.auth_region = Some("eu-central-1".into());
+        let manager = MultiTokenManager::new(config.clone(), vec![], None, None, true).unwrap();
+        let service = AdminService::new(Arc::new(manager), ["ide".to_string()]);
+        let start = service
+            .start_social_login(serde_json::from_value(json!({})).unwrap())
+            .await
+            .unwrap();
+        let session = service.login_sessions.get(&start.session_id).unwrap();
+        let state = session.state.lock().await;
+        let LoginState::Social(social) = &*state else {
+            panic!("expected Social session")
+        };
+        assert_eq!(
+            social.credentials.effective_auth_region(&config),
+            "us-east-1"
+        );
+        assert_eq!(
+            social.credentials.effective_api_region(&config),
+            "eu-west-1"
+        );
     }
 
     #[tokio::test]
@@ -580,7 +877,7 @@ mod tests {
 
     #[tokio::test]
     async fn social_callback_validation_preserves_session_and_cancel_expires_it() {
-        let service = service();
+        let service = Arc::new(service());
         let start = service
             .start_social_login(serde_json::from_value(json!({})).unwrap())
             .await
@@ -633,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_expire_and_success_can_be_polled_again() {
-        let service = service();
+        let service = Arc::new(service());
         let expired = service
             .login_sessions
             .insert(Utc::now() - Duration::seconds(1), LoginState::Expired);
@@ -654,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_region_start_url_and_token_endpoint_before_network_access() {
-        let service = service();
+        let service = Arc::new(service());
         for region in [
             "",
             "https://example.com",

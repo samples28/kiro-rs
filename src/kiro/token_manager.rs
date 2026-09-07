@@ -776,8 +776,8 @@ pub struct MultiTokenManager {
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
-    /// 是否为多凭据格式（数组格式才回写）
-    is_multiple_format: bool,
+    /// 是否为多凭据格式（显式新增凭据成功后会升级旧格式）
+    is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 全局冷却限流配置（运行时可修改）
@@ -904,7 +904,7 @@ impl MultiTokenManager {
     /// * `credentials` - 凭据列表
     /// * `proxy` - 可选的代理配置
     /// * `credentials_path` - 凭据文件路径（用于回写）
-    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `is_multiple_format` - 是否为多凭据格式（新增凭据时会将旧格式升级为数组）
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
@@ -1022,7 +1022,7 @@ impl MultiTokenManager {
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
-            is_multiple_format,
+            is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             cooldown_enabled: Mutex::new(cooldown_enabled),
             cooldown_seconds: Mutex::new(cooldown_seconds),
@@ -1614,10 +1614,20 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
+        let entries = self.entries.lock();
+        self.persist_credentials_locked(&entries, false)
+    }
+
+    /// 调用方须持有 entries 锁，保证写盘顺序与内存更新一致。
+    /// 显式新增凭据时允许将旧版单对象配置升级为数组，成功后继续按数组回写。
+    fn persist_credentials_locked(
+        &self,
+        entries: &[CredentialEntry],
+        allow_format_upgrade: bool,
+    ) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
+        if !self.is_multiple_format.load(Ordering::Relaxed) && !allow_format_upgrade {
             return Ok(false);
         }
 
@@ -1627,19 +1637,16 @@ impl MultiTokenManager {
         };
 
         // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    let mut cred = e.credentials.clone();
-                    cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
-                    cred
-                })
-                .collect()
-        };
+        let credentials: Vec<KiroCredentials> = entries
+            .iter()
+            .map(|e| {
+                let mut cred = e.credentials.clone();
+                cred.canonicalize_auth_method();
+                // 同步 disabled 状态到凭据对象
+                cred.disabled = e.disabled;
+                cred
+            })
+            .collect();
 
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
@@ -1652,6 +1659,7 @@ impl MultiTokenManager {
             std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
+        self.is_multiple_format.store(true, Ordering::Relaxed);
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
     }
@@ -2497,17 +2505,12 @@ impl MultiTokenManager {
             }
         }
 
-        // 4. 分配新 ID
+        // 4-6. 分配 ID、插入与持久化在同一锁内完成，保存失败时不发布新凭据。
         let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
-        };
-
-        // 5. 设置 ID
-        final_cred.id = Some(new_id);
-
-        {
             let mut entries = self.entries.lock();
+            let new_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            final_cred.id = Some(new_id);
+
             // balanced 模式下，新凭据从当前最小 success_count 开始，避免 count 落差导致长时间单点倾斜
             let min_success_count = entries
                 .iter()
@@ -2530,10 +2533,12 @@ impl MultiTokenManager {
                 rate_limit_cooldown_until: None,
                 rate_limit_cooldown_secs_override: None,
             });
-        }
-
-        // 6. 持久化
-        self.persist_credentials()?;
+            if let Err(error) = self.persist_credentials_locked(&entries, true) {
+                entries.pop();
+                return Err(error);
+            }
+            new_id
+        };
 
         // 清除该 ID 可能残留的计费记录，避免复用已删除凭据 ID 时继承旧费用
         if let Some(billing) = crate::admin::billing::get() {
@@ -3447,6 +3452,111 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    mod credential_persistence_tests {
+        use super::*;
+        use crate::kiro::model::credentials::CredentialsConfig;
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new() -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("kiro-credential-persistence-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn credential(id: u64) -> KiroCredentials {
+            KiroCredentials {
+                id: Some(id),
+                machine_id: Some(format!("test-machine-{id}")),
+                kiro_api_key: Some(format!("ksk_persistence_test_{id}")),
+                auth_method: Some("api_key".into()),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn adding_to_legacy_config_survives_reload_and_later_updates() {
+            let directory = TestDirectory::new();
+            let path = directory.0.join("credentials.json");
+            std::fs::write(&path, serde_json::to_string(&credential(1)).unwrap()).unwrap();
+            let config = CredentialsConfig::load(&path).unwrap();
+            let multiple = config.is_multiple();
+            assert!(!multiple);
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                config.into_sorted_credentials(),
+                None,
+                Some(path.clone()),
+                multiple,
+            )
+            .unwrap();
+
+            let id = manager.add_credential(credential(2)).await.unwrap();
+            let saved = CredentialsConfig::load(&path).unwrap();
+            assert!(
+                saved.is_multiple(),
+                "adding must migrate the legacy object to an array"
+            );
+            assert_eq!(saved.into_sorted_credentials().len(), 2);
+
+            manager.set_disabled(id, true).unwrap();
+            let saved = CredentialsConfig::load(&path).unwrap();
+            let credentials = saved.into_sorted_credentials();
+            assert!(
+                credentials
+                    .iter()
+                    .find(|cred| cred.id == Some(id))
+                    .unwrap()
+                    .disabled
+            );
+            assert!(credentials.iter().any(|cred| cred.id == Some(1)));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn failed_addition_does_not_leave_a_credential_and_can_be_retried() {
+            for multiple in [true, false] {
+                let directory = TestDirectory::new();
+                let path = directory.0.join("credentials.json");
+                // A directory at the file path reliably rejects writes on Windows and Unix.
+                std::fs::create_dir(&path).unwrap();
+                let manager = MultiTokenManager::new(
+                    Config::default(),
+                    vec![credential(1)],
+                    None,
+                    Some(path.clone()),
+                    multiple,
+                )
+                .unwrap();
+
+                assert!(manager.add_credential(credential(2)).await.is_err());
+                assert_eq!(
+                    manager.total_count(),
+                    1,
+                    "failed addition must be rolled back"
+                );
+                assert_eq!(manager.available_count(), 1);
+
+                std::fs::remove_dir(&path).unwrap();
+                let id = manager.add_credential(credential(2)).await.unwrap();
+                assert_eq!(id, 2);
+                let saved = CredentialsConfig::load(&path)
+                    .unwrap()
+                    .into_sorted_credentials();
+                assert_eq!(saved.len(), 2);
+                assert_eq!(saved.iter().filter(|cred| cred.id == Some(id)).count(), 1);
+            }
+        }
     }
 
     #[tokio::test]

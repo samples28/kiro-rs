@@ -88,7 +88,12 @@ pub struct StartDeviceAuthorizationResponse {
     #[serde(default)]
     pub verification_uri_complete: Option<String>,
     pub expires_in: i64,
+    #[serde(default = "default_poll_interval")]
     pub interval: i64,
+}
+
+fn default_poll_interval() -> i64 {
+    5
 }
 
 /// 轮询 Token 请求体（设备授权）
@@ -147,4 +152,23 @@ pub struct SocialCreateTokenResponse {
     pub expires_in: Option<i64>,
     #[serde(default)]
     pub profile_arn: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_authorization_defaults_optional_poll_interval_to_five_seconds() {
+        let mut response = serde_json::json!({
+            "deviceCode": "device", "userCode": "ABCD-EFGH",
+            "verificationUri": "https://example.com/authorize", "expiresIn": 600
+        });
+        let parsed: StartDeviceAuthorizationResponse =
+            serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(parsed.interval, 5);
+        response["interval"] = serde_json::json!(12);
+        let parsed: StartDeviceAuthorizationResponse = serde_json::from_value(response).unwrap();
+        assert_eq!(parsed.interval, 12);
+    }
 }

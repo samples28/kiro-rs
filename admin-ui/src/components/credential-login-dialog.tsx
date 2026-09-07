@@ -102,10 +102,7 @@ export function CredentialLoginDialog({ mode, onClose, onSuccess }: {
     clearTimeout(timer.current)
     timer.current = setTimeout(async () => {
       if (!active.current || completed.current || manuallyCompleting.current) return
-      if (Date.now() >= Date.parse(current.expiresAt)) {
-        fail('登录会话已过期，请重新发起登录。')
-        return
-      }
+      // 由服务器判断过期，避免客户端时钟偏差或正在保存时误报过期。
       const request = new AbortController()
       controller.current = request
       try {
@@ -127,11 +124,13 @@ export function CredentialLoginDialog({ mode, onClose, onSuccess }: {
   }
 
   const copy = async (text: string) => {
+    const sessionId = sessionRef.current?.sessionId
+    const stillWaiting = () => active.current && !completed.current && sessionRef.current?.sessionId === sessionId
     try {
       await navigator.clipboard.writeText(text)
-      if (active.current) { setManualCopy(false); toast.success('已复制') }
+      if (stillWaiting()) { setManualCopy(false); toast.success('已复制') }
     } catch {
-      if (!active.current) return
+      if (!stillWaiting()) return
       setManualCopy(true)
       linkRef.current?.focus()
       linkRef.current?.select()
@@ -169,9 +168,10 @@ export function CredentialLoginDialog({ mode, onClose, onSuccess }: {
       setStep('waiting')
       const url = 'portalUrl' in current ? current.portalUrl : current.verificationUriComplete ?? current.verificationUri
       if (loginWindow) loginWindow.location.href = url
-      if (incognito) await copy(url)
       // 本机、远程及端口转发均支持轮询；回调不可达时可手动粘贴。
       if (active.current) schedulePoll(current, 'pollInterval' in current ? current.pollInterval : 2)
+      // 剪贴板权限可能一直等待用户选择，不能阻塞登录状态轮询。
+      if (incognito) void copy(url)
     } catch (e) {
       loginWindow?.close()
       if (active.current) setError('发起登录失败：' + extractErrorMessage(e))

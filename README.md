@@ -4,6 +4,8 @@
 
 管理后台的“添加凭据”右侧提供“登录”菜单，支持 Kiro 账号（Google / GitHub）、AWS Builder ID 和企业 IAM Identity Center SSO。授权完成后自动验证、保存并启用凭据，按现有设置分配代理并刷新余额。
 
+使用旧版单对象凭据配置时，新增凭据会自动将配置转换为数组，并保留原有凭据。
+
 - Kiro 账号：打开登录页完成授权；本机可自动接收回调。远程访问、Docker 或端口转发时，如果跳转到无法访问的 localhost / 127.0.0.1 地址，复制该页面地址栏中的完整 URL，粘贴到后台“回调地址”后点击“完成登录”。
 - AWS Builder ID：SSO Start URL 留空，在授权页确认设备验证码。
 - 企业 SSO：填写组织的 HTTPS SSO Start URL 和对应 AWS Region，再完成设备授权。

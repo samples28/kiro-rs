@@ -245,6 +245,14 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        self.add_credential_with_balance(req, true).await
+    }
+
+    async fn add_credential_with_balance(
+        &self,
+        req: AddCredentialRequest,
+        fetch_balance: bool,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -327,12 +335,17 @@ impl AdminService {
         }
 
         // 主动获取订阅等级和余额（锁外执行，不阻塞其他分配）
-        let balance = match self.get_balance(credential_id).await {
-            Ok(b) => Some(b),
-            Err(e) => {
-                tracing::warn!("添加凭据后获取余额失败（不影响凭据添加）: {}", e);
-                None
+        // 登录会话须在持久化后立即记录成功，余额由前端另行查询。
+        let balance = if fetch_balance {
+            match self.get_balance(credential_id).await {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!("添加凭据后获取余额失败（不影响凭据添加）: {}", e);
+                    None
+                }
             }
+        } else {
+            None
         };
 
         let email = balance.as_ref().and_then(|b| b.email.clone()).or(req.email);
