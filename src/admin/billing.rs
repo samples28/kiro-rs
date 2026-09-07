@@ -160,7 +160,10 @@ impl BillingStats {
 /// 将模型名标准化为计费键名
 fn normalize_model_name(model: &str) -> String {
     let lower = model.to_lowercase();
-    if lower.contains("opus") && (lower.contains("4-8") || lower.contains("4.8")) {
+    if lower.contains("opus-5") || lower.contains("opus5") {
+        // claude-opus-5 系列（用 "opus-5" 而非 "-5" 匹配，避免误伤其他带 5 的名字）
+        "claude-opus-5".to_string()
+    } else if lower.contains("opus") && (lower.contains("4-8") || lower.contains("4.8")) {
         "claude-opus-4-8".to_string()
     } else if lower.contains("opus") && (lower.contains("4-7") || lower.contains("4.7")) {
         "claude-opus-4-7".to_string()
@@ -168,6 +171,10 @@ fn normalize_model_name(model: &str) -> String {
         "claude-opus-4-6".to_string()
     } else if lower.contains("sonnet") && (lower.contains("4-6") || lower.contains("4.6")) {
         "claude-sonnet-4-6".to_string()
+    } else if lower.contains("sonnet-5") || lower.contains("sonnet5") {
+        // claude-sonnet-5 系列（需在 sonnet 兜底分支之前判断，
+        // 且用 "sonnet-5" 而非 "-5" 匹配，避免误伤 claude-3-5-sonnet）
+        "claude-sonnet-5".to_string()
     } else if lower.contains("sonnet") {
         "claude-sonnet-4-5".to_string()
     } else if lower.contains("haiku") {
@@ -195,4 +202,81 @@ pub fn init(path: impl AsRef<Path>) {
 /// 获取全局计费统计实例
 pub fn get() -> Option<&'static Arc<BillingStats>> {
     BILLING.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_opus_5() {
+        // opus-5 必须独立成键，且优先于 4-8/4-7/4-6 分支
+        assert_eq!(normalize_model_name("claude-opus-5"), "claude-opus-5");
+        assert_eq!(normalize_model_name("claude-opus-5-thinking"), "claude-opus-5");
+        assert_eq!(normalize_model_name("claude-opus-5-20260101"), "claude-opus-5");
+        assert_eq!(normalize_model_name("CLAUDE-OPUS-5"), "claude-opus-5");
+        // claude-3-opus 是老模型，不含 "opus-5"，原样穿透
+        assert_eq!(normalize_model_name("claude-3-opus-20240229"), "claude-3-opus-20240229");
+    }
+
+    #[test]
+    fn test_opus_5_price_lookup() {
+        // 缺省价格表里必须能查到 opus-5，且与 opus-4-8 同价
+        let prices = crate::model::config::Config::default().model_prices;
+        let p5 = find_model_price("claude-opus-5", &prices).expect("opus-5 应存在于缺省价格表");
+        let p48 = find_model_price("claude-opus-4-8", &prices).expect("opus-4-8 应存在");
+        assert_eq!(p5.input, p48.input);
+        assert_eq!(p5.output, p48.output);
+        assert_eq!(p5.cache_read, p48.cache_read);
+        assert_eq!(p5.cache_write, p48.cache_write);
+        assert_eq!(p5.input, 5.0);
+        assert_eq!(p5.output, 25.0);
+    }
+
+    #[test]
+    fn test_normalize_sonnet_5() {
+        // sonnet-5 必须独立成键，不能落到 4-5 兜底分支
+        assert_eq!(normalize_model_name("claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(normalize_model_name("claude-sonnet-5-thinking"), "claude-sonnet-5");
+        assert_eq!(normalize_model_name("claude-sonnet-5-20260101"), "claude-sonnet-5");
+        assert_eq!(normalize_model_name("CLAUDE-SONNET-5"), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn test_normalize_sonnet_5_not_confused_with_claude_3_5() {
+        // claude-3-5-sonnet 是老模型，不能被识别成 sonnet-5
+        assert_eq!(normalize_model_name("claude-3-5-sonnet-20241022"), "claude-sonnet-4-5");
+        assert_eq!(normalize_model_name("claude-3.5-sonnet"), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_normalize_existing_models_unchanged() {
+        // 回归保护：原有模型的归一化结果不受 sonnet-5 分支影响
+        assert_eq!(normalize_model_name("claude-sonnet-4-6"), "claude-sonnet-4-6");
+        assert_eq!(normalize_model_name("claude-sonnet-4.6"), "claude-sonnet-4-6");
+        assert_eq!(normalize_model_name("claude-sonnet-4-5"), "claude-sonnet-4-5");
+        assert_eq!(normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
+        assert_eq!(normalize_model_name("claude-sonnet"), "claude-sonnet-4-5");
+        assert_eq!(normalize_model_name("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(normalize_model_name("claude-opus-4.8"), "claude-opus-4-8");
+        assert_eq!(normalize_model_name("claude-opus-4-8-thinking"), "claude-opus-4-8");
+        assert_eq!(normalize_model_name("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(normalize_model_name("claude-opus-4-6"), "claude-opus-4-6");
+        assert_eq!(normalize_model_name("claude-opus-4.6"), "claude-opus-4-6");
+        assert_eq!(normalize_model_name("claude-haiku-4-5"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn test_sonnet_5_price_lookup() {
+        // 缺省价格表里必须能查到 sonnet-5，且与 sonnet-4-6 同价
+        let prices = crate::model::config::Config::default().model_prices;
+        let p5 = find_model_price("claude-sonnet-5", &prices).expect("sonnet-5 应存在于缺省价格表");
+        let p46 = find_model_price("claude-sonnet-4-6", &prices).expect("sonnet-4-6 应存在");
+        assert_eq!(p5.input, p46.input);
+        assert_eq!(p5.output, p46.output);
+        assert_eq!(p5.cache_read, p46.cache_read);
+        assert_eq!(p5.cache_write, p46.cache_write);
+        assert_eq!(p5.input, 3.0);
+        assert_eq!(p5.output, 15.0);
+    }
 }

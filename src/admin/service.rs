@@ -12,6 +12,8 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+#[path = "login.rs"]
+mod login;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheInterruptResponse,
     CacheModeResponse, CacheRatiosResponse, CooldownConfigResponse, CredentialStatusItem,
@@ -39,6 +41,7 @@ struct CachedBalance {
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
+    login_sessions: login::LoginSessions,
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
@@ -66,6 +69,7 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
         Self {
+            login_sessions: login::LoginSessions::default(),
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,

@@ -214,3 +214,48 @@ export interface ProxyPoolResponse {
   available: number
   proxies: ProxyPoolItem[]
 }
+
+// 交互式账号登录
+export interface StartIdcLoginRequest {
+  region: string
+  startUrl?: string
+  priority?: number
+  email?: string
+  proxyUrl?: string
+}
+
+export interface StartIdcLoginResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  expiresAt: string
+  pollInterval: number
+}
+
+export type PollLoginResponse =
+  | { status: 'pending'; pollInterval: number }
+  | { status: 'success'; credentialId: number }
+  | { status: 'expired' }
+
+// Social 登录（Portal PKCE OAuth）
+export interface StartSocialLoginRequest {
+  priority?: number
+  email?: string
+  proxyUrl?: string
+  authEndpoint?: string
+}
+
+/** 远程访问时手动完成 Social 登录：从浏览器地址栏粘贴的回调 URL 中提取参数 */
+export interface CompleteSocialLoginRequest {
+  code: string
+  state: string
+  loginOption?: string
+  path?: string
+}
+
+export interface StartSocialLoginResponse {
+  sessionId: string
+  portalUrl: string
+  expiresAt: string
+}

@@ -8,6 +8,8 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, delete_pool_proxy, enable_overage,
+        start_idc_login, poll_idc_login, start_social_login, poll_social_login,
+        complete_social_login, cancel_login,
         force_refresh_token, get_all_credentials, get_billing_stats, get_cache_interrupt,
         get_cache_mode, get_cache_ratios, get_cooldown_config, get_credential_balance,
         get_load_balancing_mode, get_model_mappings, get_model_prices, get_proxy_latency,
@@ -44,6 +46,12 @@ use super::{
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
+        .route("/auth/idc/start", post(start_idc_login))
+        .route("/auth/idc/poll/{session_id}", post(poll_idc_login))
+        .route("/auth/social/start", post(start_social_login))
+        .route("/auth/social/poll/{session_id}", post(poll_social_login))
+        .route("/auth/social/complete/{session_id}", post(complete_social_login))
+        .route("/auth/sessions/{session_id}", delete(cancel_login))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),

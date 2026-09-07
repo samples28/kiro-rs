@@ -1070,6 +1070,10 @@ impl MultiTokenManager {
         &self.config
     }
 
+    pub fn proxy(&self) -> Option<ProxyConfig> {
+        self.proxy.clone()
+    }
+
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()

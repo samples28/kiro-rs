@@ -27,18 +27,22 @@ interface ModelPrice {
 type ModelPrices = Record<string, ModelPrice>
 
 const MODEL_LIST = [
+  'claude-opus-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
   'claude-opus-4-6',
+  'claude-sonnet-5',
   'claude-sonnet-4-6',
   'claude-sonnet-4-5',
   'claude-haiku-4-5',
 ]
 
 const DEFAULT_PRICES: ModelPrices = {
+  'claude-opus-5': { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   'claude-opus-4-8': { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   'claude-opus-4-7': { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   'claude-opus-4-6': { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
+  'claude-sonnet-5': { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   'claude-sonnet-4-6': { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   'claude-sonnet-4-5': { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   'claude-haiku-4-5': { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },

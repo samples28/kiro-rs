@@ -14,7 +14,7 @@ use super::{
         SetCredentialCooldownRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
         SetModelMappingsRequest, SetModelPricesRequest, SetPriorityRequest, SetProxyRequest,
         SetRateLimitCooldownRequest, SuccessResponse, ModelPricesResponse, ModelPriceItem,
-        BillingStatsResponse,
+        BillingStatsResponse, CompleteSocialLoginRequest, StartIdcLoginRequest, StartSocialLoginRequest,
     },
 };
 
@@ -425,4 +425,83 @@ pub async fn reset_billing_stats() -> impl IntoResponse {
         b.reset();
     }
     Json(SuccessResponse::new("计费统计已重置"))
+}
+
+pub async fn start_idc_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartIdcLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_idc_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn cancel_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    state.service.cancel_login(&session_id);
+    Json(SuccessResponse::new("登录会话已关闭"))
+}
+
+/// POST /api/admin/auth/idc/poll/:session_id
+/// 轮询 IdC 登录状态（由前端按 poll_interval 调用）
+pub async fn poll_idc_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.poll_idc_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/start
+/// 发起 Social 登录，返回 portal URL
+pub async fn start_social_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_social_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/poll/:session_id
+/// 轮询 Social 登录状态
+pub async fn poll_social_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.poll_social_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/complete/:session_id
+///
+/// 远程访问场景下手动完成 Social 登录：
+/// 用户从浏览器地址栏复制 OAuth 回调 URL，前端提取 code/state/login_option 后调用此接口。
+pub async fn complete_social_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<CompleteSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .complete_social_login(
+            &session_id,
+            payload.code,
+            payload.state,
+            payload.login_option,
+            payload.path,
+        )
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }

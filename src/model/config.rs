@@ -300,11 +300,11 @@ fn default_debug_log_dir() -> String {
 fn default_model_prices() -> HashMap<String, ModelPrice> {
     let mut m = HashMap::new();
     // Opus 系列: input=$5, output=$25, cache_read=$0.50, cache_write=$6.25
-    for name in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6"] {
+    for name in ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6"] {
         m.insert(name.to_string(), ModelPrice { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 });
     }
     // Sonnet 系列: input=$3, output=$15, cache_read=$0.30, cache_write=$3.75
-    for name in ["claude-sonnet-4-6", "claude-sonnet-4-5"] {
+    for name in ["claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
         m.insert(name.to_string(), ModelPrice { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 });
     }
     // Haiku: input=$1, output=$5, cache_read=$0.10, cache_write=$1.25

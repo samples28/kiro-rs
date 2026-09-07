@@ -22,6 +22,8 @@ import type {
   SetProxyRequest,
   ProxyLatencyResponse,
   ProxyPoolResponse,
+  StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+  StartSocialLoginResponse, CompleteSocialLoginRequest, PollLoginResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -31,6 +33,30 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
+
+export async function startIdcLogin(req: StartIdcLoginRequest): Promise<StartIdcLoginResponse> {
+  const { data } = await api.post<StartIdcLoginResponse>('/auth/idc/start', req)
+  return data
+}
+
+export async function startSocialLogin(req: StartSocialLoginRequest): Promise<StartSocialLoginResponse> {
+  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', req)
+  return data
+}
+
+export async function pollLogin(kind: 'social' | 'idc', sessionId: string, signal?: AbortSignal): Promise<PollLoginResponse> {
+  const { data } = await api.post<PollLoginResponse>(`/auth/${kind}/poll/${sessionId}`, undefined, { signal })
+  return data
+}
+
+export async function completeSocialLogin(sessionId: string, req: CompleteSocialLoginRequest, signal?: AbortSignal): Promise<PollLoginResponse> {
+  const { data } = await api.post<PollLoginResponse>(`/auth/social/complete/${sessionId}`, req, { signal })
+  return data
+}
+
+export async function cancelLogin(sessionId: string): Promise<void> {
+  await api.delete(`/auth/sessions/${sessionId}`)
+}
 
 // 请求拦截器添加 API Key
 api.interceptors.request.use((config) => {

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, Timer, Database, Layers, Zap, Search, DollarSign, Power, PowerOff } from 'lucide-react'
+import { RefreshCw, LogOut, LogIn, ChevronDown, Key, Building2, Moon, Sun, Server, Plus, Upload, Trash2, Timer, Database, Layers, Zap, Search, DollarSign, Power, PowerOff } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,6 +10,8 @@ import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { CredentialTable } from '@/components/credential-table'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { CredentialLoginDialog, type LoginMode } from '@/components/credential-login-dialog'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '@/components/ui/dropdown-menu'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { CooldownConfigDialog } from '@/components/cooldown-config-dialog'
 import { CacheRatiosDialog } from '@/components/cache-ratios-dialog'
@@ -28,6 +30,7 @@ interface DashboardProps {
 
 export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [loginMode, setLoginMode] = useState<LoginMode | null>(null)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [cooldownDialogOpen, setCooldownDialogOpen] = useState(false)
   const [cacheRatiosDialogOpen, setCacheRatiosDialogOpen] = useState(false)
@@ -992,6 +995,16 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="outline"><LogIn className="mr-2 h-4 w-4" />登录<ChevronDown className="ml-2 h-4 w-4" /></Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onSelect={() => setLoginMode('social')}><LogIn />Kiro 账号登录（Google / GitHub）</DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setLoginMode('builder-id')}><Key />AWS SSO / Builder ID 登录</DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setLoginMode('enterprise')}><Building2 />Enterprise (IAM Identity Center) 登录</DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
           {data?.credentials.length === 0 ? (
@@ -1100,6 +1113,18 @@ export function Dashboard({ onLogout, onNavigate }: DashboardProps) {
       </main>
 
       {/* 添加凭据对话框 */}
+      {loginMode && <CredentialLoginDialog
+        key={loginMode}
+        mode={loginMode}
+        onClose={() => setLoginMode(null)}
+        onSuccess={(id) => {
+          void queryClient.invalidateQueries({ queryKey: ['credentials'] })
+          void getCredentialBalance(id).then(balance => {
+            setBalanceMap(prev => new Map(prev).set(id, balance))
+          }).catch(() => {})
+          void getProxyPool().then(setProxyPoolData).catch(() => {})
+        }}
+      />}
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}

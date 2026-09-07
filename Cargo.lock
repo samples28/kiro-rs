@@ -849,6 +849,7 @@ dependencies = [
  "crc",
  "fastrand",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "mime_guess",
