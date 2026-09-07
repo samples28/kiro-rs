@@ -102,28 +102,31 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = if let Some(ref provider) = state.kiro_provider {
-        let mappings = provider.token_manager().get_model_mappings();
-        let mut models = Vec::with_capacity(mappings.len() * 2);
-        for m in &mappings {
-            models.push(Model {
-                id: m.from.clone(),
-                object: "model".to_string(),
-                created: 1770163200,
-                owned_by: "anthropic".to_string(),
-                display_name: m.from.clone(),
-                model_type: "chat".to_string(),
-                max_tokens: 64000,
-            });
-            let thinking_id = format!("{}-thinking", m.from);
-            models.push(Model {
-                id: thinking_id.clone(),
-                object: "model".to_string(),
-                created: 1770163200,
-                owned_by: "anthropic".to_string(),
-                display_name: format!("{} (Thinking)", m.from),
-                model_type: "chat".to_string(),
-                max_tokens: 64000,
-            });
+        let (mappings, free_mappings) = provider.token_manager().get_model_mapping_tables();
+        let mut models = Vec::with_capacity((mappings.len() + free_mappings.len()) * 2);
+        let mut seen = std::collections::HashSet::new();
+        let mut add_model = |id: String, display_name: String| {
+            if seen.insert(id.to_lowercase()) {
+                models.push(Model {
+                    id,
+                    object: "model".to_string(),
+                    created: 1770163200,
+                    owned_by: "anthropic".to_string(),
+                    display_name,
+                    model_type: "chat".to_string(),
+                    max_tokens: 64000,
+                });
+            }
+        };
+        for mapping in mappings.iter().chain(&free_mappings) {
+            let from = mapping.from.trim();
+            if from.is_empty() || mapping.to.trim().is_empty() {
+                continue;
+            }
+            add_model(from.to_string(), from.to_string());
+            if !from.to_lowercase().ends_with("-thinking") {
+                add_model(format!("{from}-thinking"), format!("{from} (Thinking)"));
+            }
         }
         models
     } else {
@@ -206,7 +209,7 @@ async fn handle_messages_common(
     }
 
     // 解析模型映射
-    let model_id = match provider.token_manager().resolve_model(&payload.model) {
+    let model_id = match provider.token_manager().resolve_request_model(&payload.model) {
         Some(id) => id,
         None => {
             tracing::warn!("模型不支持: {}", payload.model);
@@ -258,15 +261,6 @@ async fn handle_messages_common(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 阶段 2：记录转换后的 Kiro 请求
-    if let Some(ref log) = debug_log_instance {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&request_body) {
-            log.lock().set_kiro_request(val);
-        }
-    }
-
     let (creation, read, uncached, first_turn, output_ratio) =
         provider.token_manager().get_cache_ratios();
     let cache_usage = {
@@ -307,7 +301,10 @@ async fn handle_stream_request(
     debug_log_instance: Option<debug_log::SharedRequestLog>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (credential_id, response) = match provider.call_api_stream(request_body, Some(model)).await {
+    let (credential_id, response) = match provider
+        .call_api_stream(request_body, Some(model), debug_log_instance.as_ref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error_with_log(e, debug_log_instance.as_ref()),
     };
@@ -448,7 +445,10 @@ async fn handle_non_stream_request(
     debug_log_instance: Option<debug_log::SharedRequestLog>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (credential_id, response) = match provider.call_api(request_body, Some(model)).await {
+    let (credential_id, response) = match provider
+        .call_api(request_body, Some(model), debug_log_instance.as_ref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error_with_log(e, debug_log_instance.as_ref()),
     };

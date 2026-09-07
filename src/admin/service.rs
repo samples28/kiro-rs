@@ -14,6 +14,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 #[path = "login.rs"]
 mod login;
+#[cfg(test)]
+#[path = "tests/model_mapping.rs"]
+mod model_mapping_tests;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheInterruptResponse,
     CacheModeResponse, CacheRatiosResponse, CooldownConfigResponse, CredentialStatusItem,
@@ -510,8 +513,7 @@ impl AdminService {
 
     /// 获取模型映射
     pub fn get_model_mappings(&self) -> ModelMappingsResponse {
-        let mappings = self.token_manager.get_model_mappings();
-        let free_model_mappings = self.token_manager.get_free_model_mappings();
+        let (mappings, free_model_mappings) = self.token_manager.get_model_mapping_tables();
         ModelMappingsResponse {
             mappings: mappings
                 .into_iter()
@@ -538,23 +540,15 @@ impl AdminService {
             })
             .collect();
 
+        let config_free_mappings = req.free_model_mappings.map(|mappings| {
+            mappings
+                .into_iter()
+                .map(|m| crate::model::config::ModelMapping { from: m.from, to: m.to })
+                .collect()
+        });
         self.token_manager
-            .set_model_mappings(config_mappings)
+            .set_model_mappings(config_mappings, config_free_mappings)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-
-        // 如果提供了 free_model_mappings，也更新
-        if let Some(free_mappings) = &req.free_model_mappings {
-            let config_free_mappings: Vec<crate::model::config::ModelMapping> = free_mappings
-                .iter()
-                .map(|m| crate::model::config::ModelMapping {
-                    from: m.from.clone(),
-                    to: m.to.clone(),
-                })
-                .collect();
-            self.token_manager
-                .set_free_model_mappings(config_free_mappings)
-                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-        }
 
         Ok(self.get_model_mappings())
     }

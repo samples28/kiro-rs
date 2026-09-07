@@ -326,6 +326,16 @@ pub struct ModelMapping {
     pub to: String,
 }
 
+impl ModelMapping {
+    /// Free 映射沿用忽略大小写的包含匹配；空规则不参与调度或转发。
+    pub fn matches_keyword(&self, model: &str) -> bool {
+        let from = self.from.trim();
+        !from.is_empty()
+            && !self.to.trim().is_empty()
+            && model.to_lowercase().contains(&from.to_lowercase())
+    }
+}
+
 fn default_model_mappings() -> Vec<ModelMapping> {
     vec![
         ModelMapping { from: "claude-opus-4-7".into(), to: "claude-opus-4.6".into() },

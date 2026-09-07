@@ -1201,19 +1201,12 @@ impl MultiTokenManager {
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 客户端原始模型名称，Free 使用专属映射，其他账号使用通用映射
     fn select_next_credential(&self, model: Option<&str>) -> SelectResult {
+        let regular_model_supported = model.is_none_or(|m| self.resolve_model(m).is_some());
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let free_model_mappings = self.free_model_mappings.lock().clone();
-
-        // 判断请求的模型是否在 free 映射表中
-        let is_free_supported_model = model
-            .map(|m| {
-                let ml = m.to_lowercase();
-                free_model_mappings.iter().any(|mapping| ml.contains(&mapping.from.to_lowercase()))
-            })
-            .unwrap_or(false);
 
         // 过滤可用凭据索引（未禁用 + 模型匹配 + 不在 429 冷却中）
         let available_indices: Vec<usize> = entries
@@ -1225,7 +1218,9 @@ impl MultiTokenManager {
                 }
                 // 模型兼容性检查（Free 账号只支持 free_model_mappings 中配置的模型）
                 if let Some(m) = model {
-                    if !e.credentials.supports_model(m, &free_model_mappings) {
+                    if !e.credentials.supports_model(m, &free_model_mappings)
+                        || (!e.credentials.is_free() && !regular_model_supported)
+                    {
                         return false;
                     }
                 }
@@ -1272,25 +1267,13 @@ impl MultiTokenManager {
             return SelectResult::CooldownUntil(earliest);
         }
 
-        // 如果请求模型是 free 支持的，优先选 free 凭据
-        let final_indices = if is_free_supported_model {
-            let free_cooled: Vec<usize> = cooled_indices
-                .iter()
-                .filter(|&&i| entries[i].credentials.is_free())
-                .copied()
-                .collect();
-            // free 凭据有可用的就用 free，否则 fallback 到所有已冷却的
-            if free_cooled.is_empty() { cooled_indices } else { free_cooled }
-        } else {
-            cooled_indices
-        };
-
+        // Free 与付费账号平级，只按配置的优先级或均衡策略调度。
         let mode = self.load_balancing_mode.lock().clone();
         let selected_idx = match mode.as_str() {
             "balanced" => {
                 // 按剩余吞吐容量选择：容量越大越优先
                 // 容量相等时，选最久没使用的（轮流分配）
-                *final_indices
+                *cooled_indices
                     .iter()
                     .max_by(|&&a, &&b| {
                         let cap_a = self.calc_remaining_capacity(&entries[a], now);
@@ -1313,7 +1296,7 @@ impl MultiTokenManager {
                     .unwrap()
             }
             _ => {
-                *final_indices
+                *cooled_indices
                     .iter()
                     .min_by_key(|&&i| entries[i].credentials.priority)
                     .unwrap()
@@ -1360,7 +1343,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 客户端原始模型名称，Free 使用专属映射，其他账号使用通用映射
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -1376,85 +1359,31 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // priority 模式：检查 current_id 是否可用且已冷却
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let mut entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    entries
-                        .iter_mut()
-                        .find(|e| {
-                            if e.id != current_id || e.disabled {
-                                return false;
-                            }
-                            // 429 冷却中跳过
-                            if let Some(until) = e.rate_limit_cooldown_until {
-                                if now < until {
-                                    return false;
-                                }
-                            }
-                            match self.effective_cooldown(&e.credentials) {
-                                None => true,
-                                Some((window, max_req)) => {
-                                    Self::is_cooled(&e.dispatch_history, now, window, max_req)
-                                }
-                            }
-                        })
-                        .map(|e| {
-                            match self.effective_cooldown(&e.credentials) {
-                                Some((window, _)) => {
-                                    e.dispatch_history.push_back(now);
-                                    while let Some(&front) = e.dispatch_history.front() {
-                                        if now.duration_since(front) >= window {
-                                            e.dispatch_history.pop_front();
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    e.dispatch_history.push_back(now);
-                                    let cutoff = StdDuration::from_secs(60);
-                                    while let Some(&front) = e.dispatch_history.front() {
-                                        if now.duration_since(front) >= cutoff {
-                                            e.dispatch_history.pop_front();
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            e.success_count += 1;
-                            e.last_used_at = Some(Utc::now().to_rfc3339());
-                            (e.id, e.credentials.clone())
-                        })
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    match self.select_next_credential(model) {
-                        SelectResult::Ready(new_id, new_creds) => {
-                            *self.current_id.lock() = new_id;
-                            (new_id, new_creds)
-                        }
-                        SelectResult::CooldownUntil(wake_at) => {
-                            let wait = wake_at.saturating_duration_since(Instant::now());
-                            tokio::time::sleep(wait).await;
+                // 每次按当前模型及冷却状态重新比较所有候选，避免低优先级账号一直被复用。
+                match self.select_next_credential(model) {
+                    SelectResult::Ready(new_id, new_creds) => {
+                        *self.current_id.lock() = new_id;
+                        (new_id, new_creds)
+                    }
+                    SelectResult::CooldownUntil(wake_at) => {
+                        let wait = wake_at.saturating_duration_since(Instant::now());
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    SelectResult::None => {
+                        if self.try_self_heal() {
                             continue;
                         }
-                        SelectResult::None => {
-                            if self.try_self_heal() {
-                                continue;
+                        let entries = self.entries.lock();
+                        let available = entries.iter().filter(|e| !e.disabled).count();
+                        if available > 0 {
+                            if let Some(model) = model {
+                                anyhow::bail!(
+                                    "没有支持请求模型 {model} 的可用凭据（其余凭据可能处于冷却中）"
+                                );
                             }
-                            let entries = self.entries.lock();
-                            let available = entries.iter().filter(|e| !e.disabled).count();
-                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                         }
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
             };
@@ -3063,66 +2992,89 @@ impl MultiTokenManager {
         self.model_mappings.lock().clone()
     }
 
-    /// 设置模型映射列表（Admin API）
+    /// 读取同一次更新中的两组映射，避免并发保存时返回混合版本。
+    pub fn get_model_mapping_tables(&self) -> (
+        Vec<crate::model::config::ModelMapping>,
+        Vec<crate::model::config::ModelMapping>,
+    ) {
+        let mappings = self.model_mappings.lock();
+        let free_mappings = self.free_model_mappings.lock();
+        (mappings.clone(), free_mappings.clone())
+    }
+
+    /// 两组映射先一起校验、保存，成功后再发布到内存，避免失败时只更新一组。
+    /// 未提供 Free 映射时保留现有规则，显式空数组则清空。
     pub fn set_model_mappings(
         &self,
-        mappings: Vec<crate::model::config::ModelMapping>,
+        mut mappings: Vec<crate::model::config::ModelMapping>,
+        mut free_mappings: Option<Vec<crate::model::config::ModelMapping>>,
     ) -> anyhow::Result<()> {
-        for m in &mappings {
-            if m.from.is_empty() || m.to.is_empty() {
+        use anyhow::Context;
+
+        for mapping in mappings.iter_mut().chain(free_mappings.iter_mut().flatten()) {
+            mapping.from = mapping.from.trim().to_string();
+            mapping.to = mapping.to.trim().to_string();
+            if mapping.from.is_empty() || mapping.to.is_empty() {
                 anyhow::bail!("模型映射的 from 和 to 不能为空");
             }
         }
-        let prev = self.model_mappings.lock().clone();
-        *self.model_mappings.lock() = mappings.clone();
-        if let Err(err) = self.persist_model_mappings() {
-            *self.model_mappings.lock() = prev;
-            return Err(err);
+
+        // 所有映射写入按相同顺序持锁，串行完成整组更新。
+        let mut current_mappings = self.model_mappings.lock();
+        let mut current_free_mappings = self.free_model_mappings.lock();
+        let free_mappings = free_mappings.unwrap_or_else(|| current_free_mappings.clone());
+
+        if let Some(config_path) = self.config.config_path() {
+            let mut config = Config::load(config_path)
+                .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+            config.model_mappings = mappings.clone();
+            config.free_model_mappings = free_mappings.clone();
+            config
+                .save()
+                .with_context(|| format!("持久化模型映射失败: {}", config_path.display()))?;
+        } else {
+            tracing::warn!("配置文件路径未知，模型映射仅在当前进程生效");
         }
-        tracing::info!("模型映射已更新: {} 条", mappings.len());
+
+        tracing::info!(
+            "模型映射已更新: 通用 {} 条，Free {} 条",
+            mappings.len(),
+            free_mappings.len()
+        );
+        *current_mappings = mappings;
+        *current_free_mappings = free_mappings;
         Ok(())
     }
 
-    /// 获取 Free 账号模型映射列表
-    pub fn get_free_model_mappings(&self) -> Vec<crate::model::config::ModelMapping> {
-        self.free_model_mappings.lock().clone()
+    /// 按配置顺序匹配客户端原始模型名，返回 Free 映射右侧的最终上游模型 ID。
+    pub fn resolve_free_model(&self, model: &str) -> Option<String> {
+        self.free_model_mappings
+            .lock()
+            .iter()
+            .find(|mapping| mapping.matches_keyword(model))
+            .map(|mapping| mapping.to.trim().to_string())
     }
 
-    /// 设置 Free 账号模型映射列表（Admin API）
-    pub fn set_free_model_mappings(&self, mappings: Vec<crate::model::config::ModelMapping>) -> anyhow::Result<()> {
-        let prev = self.free_model_mappings.lock().clone();
-        *self.free_model_mappings.lock() = mappings.clone();
-        if let Err(err) = self.persist_free_model_mappings() {
-            *self.free_model_mappings.lock() = prev;
-            return Err(err);
+    /// 请求转换前检查模型是否可解析，支持只配置在 Free 映射中的别名。
+    /// 最终上游模型仍须在选定凭据后重新解析。
+    pub fn resolve_request_model(&self, model: &str) -> Option<String> {
+        self.resolve_model(model)
+            .or_else(|| self.resolve_free_model(model))
+    }
+
+    pub fn resolve_model_for_credential(
+        &self,
+        model: &str,
+        credentials: &KiroCredentials,
+    ) -> Option<String> {
+        if credentials.is_free() {
+            self.resolve_free_model(model)
+        } else {
+            self.resolve_model(model)
         }
-        tracing::info!("Free 模型映射已更新: {} 条", mappings.len());
-        Ok(())
     }
 
-    fn persist_free_model_mappings(&self) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，Free 模型映射仅在当前进程生效");
-                return Ok(());
-            }
-        };
-
-        let mappings = self.free_model_mappings.lock().clone();
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.free_model_mappings = mappings;
-        config
-            .save()
-            .with_context(|| format!("持久化 Free 模型映射失败: {}", config_path.display()))?;
-
-        Ok(())
-    }
-
-    /// 根据映射解析模型 ID
+    /// 根据通用映射解析模型 ID
     pub fn resolve_model(&self, model: &str) -> Option<String> {
         let mappings = self.model_mappings.lock();
         let model_lower = model.to_lowercase();
@@ -3147,28 +3099,6 @@ impl MultiTokenManager {
         // Fallback 到模式匹配
         drop(mappings);
         crate::anthropic::map_model_fallback(model)
-    }
-
-    fn persist_model_mappings(&self) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，模型映射仅在当前进程生效");
-                return Ok(());
-            }
-        };
-
-        let mappings = self.model_mappings.lock().clone();
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.model_mappings = mappings;
-        config
-            .save()
-            .with_context(|| format!("持久化模型映射失败: {}", config_path.display()))?;
-
-        Ok(())
     }
 
     /// 设置单个凭据的冷却限流配置（Admin API）
@@ -3328,6 +3258,10 @@ impl Drop for MultiTokenManager {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/model_mapping.rs"]
+mod model_mapping_tests;
 
 #[cfg(test)]
 mod tests {

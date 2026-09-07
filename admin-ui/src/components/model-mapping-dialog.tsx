@@ -193,7 +193,7 @@ export function ModelMappingDialog({ open, onOpenChange }: ModelMappingDialogPro
                 添加 Free 映射
               </Button>
               <p className="text-xs text-muted-foreground">
-                Free 账号只能处理左侧匹配的模型请求，转发为右侧模型。不在此列表中的模型不会分配到 Free 凭据。
+                Free 与付费账号按相同的优先级或均衡规则调度。选中 Free 账号时，按左侧匹配客户端请求模型，实际转发为右侧模型；未匹配的请求不会分配到 Free。匹配忽略大小写，采用包含匹配，多条命中时使用第一条。
               </p>
             </div>
           </div>

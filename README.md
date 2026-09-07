@@ -13,4 +13,8 @@
 
 前端资源随 Rust 程序嵌入，更新后需先在 `admin-ui` 执行 `npm ci`、`npm run build`，再在项目根目录执行 `cargo build --release` 并重启服务。
 
+模型映射中，Free 与付费账号平级参与调度，按配置的优先级或均衡规则选择账号。选中 Free 账号后，使用 Free 映射右侧的模型；其他账号使用通用映射。Free 规则匹配客户端原始模型名，忽略大小写并采用包含匹配，多条命中时使用第一条，没有匹配规则则跳过 Free 账号。
+
+例如，通用映射配置 `claude-opus-4-6 → claude-opus-4.6`，Free 映射配置 `claude-opus-4-6 → claude-sonnet-4.5`：同一个 Opus 4.6 请求分配给 Free 时实际调用 Sonnet 4.5，分配给付费账号时实际调用 Opus 4.6。仅有 Free 账号也适用；切换账号重试时会重新应用对应映射。保存映射后，后续请求即可使用新规则。
+
 ---

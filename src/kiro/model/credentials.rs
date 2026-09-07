@@ -305,9 +305,10 @@ impl KiroCredentials {
         if !self.is_free() {
             return true;
         }
-        let m = model.to_lowercase();
         // free_model_mappings 中的 from 字段作为关键字匹配
-        free_model_mappings.iter().any(|mapping| m.contains(&mapping.from.to_lowercase()))
+        free_model_mappings
+            .iter()
+            .any(|mapping| mapping.matches_keyword(model))
     }
 
     /// 是否为 Social 登录（Github / Google）

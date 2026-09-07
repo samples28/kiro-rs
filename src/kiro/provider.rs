@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+use crate::common::debug_log::SharedRequestLog;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
@@ -161,14 +162,26 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     /// 返回 (凭据 ID, Response)
-    pub async fn call_api(&self, request_body: &str, original_model: Option<&str>) -> anyhow::Result<(u64, reqwest::Response)> {
-        self.call_api_with_retry(request_body, false, original_model).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        original_model: Option<&str>,
+        request_log: Option<&SharedRequestLog>,
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
+        self.call_api_with_retry(request_body, false, original_model, request_log)
+            .await
     }
 
     /// 发送流式 API 请求
     /// 返回 (凭据 ID, Response)
-    pub async fn call_api_stream(&self, request_body: &str, original_model: Option<&str>) -> anyhow::Result<(u64, reqwest::Response)> {
-        self.call_api_with_retry(request_body, true, original_model).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        original_model: Option<&str>,
+        request_log: Option<&SharedRequestLog>,
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
+        self.call_api_with_retry(request_body, true, original_model, request_log)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -334,6 +347,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         original_model: Option<&str>,
+        request_log: Option<&SharedRequestLog>,
     ) -> anyhow::Result<(u64, reqwest::Response)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -344,6 +358,9 @@ impl KiroProvider {
         // 用原始模型进行凭据调度（free 模型匹配需要原始模型 ID）
         let model = original_model.map(|s| s.to_string())
             .or_else(|| Self::extract_model_from_request(request_body));
+        let requested_model = model
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("请求中缺少模型 ID"))?;
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -353,6 +370,19 @@ impl KiroProvider {
                     last_error = Some(e);
                     continue;
                 }
+            };
+
+            // 按本次选中的账号解析模型；切换账号或更新映射后不能沿用上次的目标模型。
+            let Some(actual_model) = self
+                .token_manager
+                .resolve_model_for_credential(requested_model, &ctx.credentials)
+            else {
+                last_error = Some(anyhow::anyhow!(
+                    "凭据 #{} 没有匹配请求模型 {} 的映射",
+                    ctx.id,
+                    requested_model
+                ));
+                continue;
             };
 
             self.ensure_profile_arn(&mut ctx).await;
@@ -377,7 +407,22 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let mapped_body = Self::rewrite_request_model(request_body, &actual_model)?;
+            let body = endpoint.transform_api_body(&mapped_body, &rctx);
+            tracing::debug!(
+                "凭据 #{}: 请求模型 {}，实际转发模型 {}",
+                ctx.id,
+                requested_model,
+                actual_model
+            );
+            // 阶段 2：记录本次实际发送的请求，包含账号映射及端点加工后的字段。
+            // 重试时覆盖为最新尝试，确保成功和错误日志都对应最后一次上游请求。
+            if let Some(log) = request_log {
+                let value = serde_json::from_str(&body)
+                    .unwrap_or_else(|_| serde_json::Value::String(body.clone()));
+                log.lock().set_kiro_request(value);
+            }
+            tracing::debug!("Kiro request body: {}", body);
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -555,6 +600,36 @@ impl KiroProvider {
         }))
     }
 
+    /// 只改写协议中的模型字段，保留正文、工具参数等内容。
+    /// 每次重试都从原始请求体生成，防止 Free 与付费账号切换时残留旧映射。
+    fn rewrite_request_model(request_body: &str, model: &str) -> anyhow::Result<String> {
+        use anyhow::Context;
+        use serde_json::Value;
+
+        let mut body: Value =
+            serde_json::from_str(request_body).context("解析模型映射请求体失败")?;
+        let current = body
+            .pointer_mut("/conversationState/currentMessage/userInputMessage")
+            .and_then(Value::as_object_mut)
+            .context("模型映射请求体缺少当前用户消息")?;
+        current.insert("modelId".into(), Value::String(model.to_string()));
+
+        if let Some(history) = body
+            .pointer_mut("/conversationState/history")
+            .and_then(Value::as_array_mut)
+        {
+            for message in history {
+                if let Some(user) = message
+                    .get_mut("userInputMessage")
+                    .and_then(Value::as_object_mut)
+                {
+                    user.insert("modelId".into(), Value::String(model.to_string()));
+                }
+            }
+        }
+        serde_json::to_string(&body).context("序列化模型映射请求体失败")
+    }
+
     /// 从请求体中提取模型信息
     ///
     /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
@@ -616,6 +691,10 @@ fn profile_resolution_cache_key(
     );
     (id, format!("{:x}", hasher.finalize()))
 }
+
+#[cfg(test)]
+#[path = "tests/provider_model_mapping.rs"]
+mod model_mapping_tests;
 
 #[cfg(test)]
 mod tests {
