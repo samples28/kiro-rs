@@ -141,14 +141,15 @@ impl EventStreamDecoder {
             });
         }
 
+        // 保持 Recovering 状态：跨 chunk 的同一段重同步不应重复计错
         self.buffer.extend_from_slice(data);
 
-        // 从 Recovering 状态恢复到 Ready
-        if self.state == DecoderState::Recovering {
-            self.state = DecoderState::Ready;
-        }
-
         Ok(())
+    }
+
+    /// 解码器是否已因错误过多而停止（之后的数据不会再被解析）
+    pub fn is_stopped(&self) -> bool {
+        self.state == DecoderState::Stopped
     }
 
     /// 尝试解码下一个帧
@@ -172,7 +173,8 @@ impl EventStreamDecoder {
             return Ok(None);
         }
 
-        // 转移到 Parsing 状态
+        // 逐字节重同步期间的连续错误只算一次（同一段损坏数据），否则跳过几个字节就会 Stopped
+        let resyncing = self.state == DecoderState::Recovering;
         self.state = DecoderState::Parsing;
 
         match parse_frame(&self.buffer) {
@@ -190,7 +192,15 @@ impl EventStreamDecoder {
                 Ok(None)
             }
             Err(e) => {
-                self.error_count += 1;
+                let is_prelude_error = matches!(
+                    e,
+                    ParseError::PreludeCrcMismatch { .. }
+                        | ParseError::MessageTooSmall { .. }
+                        | ParseError::MessageTooLarge { .. }
+                );
+                if !(resyncing && is_prelude_error) {
+                    self.error_count += 1;
+                }
                 let error_msg = e.to_string();
 
                 // 检查是否超过最大错误数
@@ -301,11 +311,10 @@ impl<'a> Iterator for DecodeIter<'a> {
     type Item = ParseResult<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 如果处于 Stopped 或 Recovering 状态，停止迭代
-        match self.decoder.state {
-            DecoderState::Stopped => return None,
-            DecoderState::Recovering => return None,
-            _ => {}
+        // 仅在 Stopped 时停止迭代；Recovering 时继续解码，
+        // 否则一帧损坏就会让同一批数据中其后的所有正常帧被静默丢弃
+        if self.decoder.state == DecoderState::Stopped {
+            return None;
         }
 
         match self.decoder.decode() {
@@ -333,5 +342,92 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// 构造一个合法帧：仅含 `:message-type: event` 头部和给定 payload
+    fn build_frame(payload: &[u8]) -> Vec<u8> {
+        use super::super::crc::crc32;
+
+        let name = b":message-type";
+        let value = b"event";
+        let mut headers = Vec::new();
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name);
+        headers.push(7); // String
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value);
+
+        let total_length = PRELUDE_SIZE + headers.len() + payload.len() + 4;
+        let mut frame = Vec::with_capacity(total_length);
+        frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    fn decode_all(decoder: &mut EventStreamDecoder) -> (Vec<Vec<u8>>, usize) {
+        let mut payloads = Vec::new();
+        let mut errors = 0;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => payloads.push(frame.payload),
+                Err(_) => errors += 1,
+            }
+        }
+        (payloads, errors)
+    }
+
+    #[test]
+    fn test_decoder_continues_after_corrupt_frame_in_same_batch() {
+        let mut corrupt = build_frame(b"{\"n\":2}");
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff; // 破坏 message CRC
+
+        let mut data = build_frame(b"{\"n\":1}");
+        data.extend_from_slice(&corrupt);
+        data.extend_from_slice(&build_frame(b"{\"n\":3}"));
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&data).unwrap();
+        let (payloads, errors) = decode_all(&mut decoder);
+
+        assert_eq!(errors, 1);
+        assert_eq!(payloads, vec![b"{\"n\":1}".to_vec(), b"{\"n\":3}".to_vec()]);
+        assert!(!decoder.is_stopped());
+    }
+
+    #[test]
+    fn test_decoder_resyncs_after_garbage_without_stopping() {
+        // 一段长于 max_errors 的垃圾字节后跟正常帧：逐字节重同步不应把解码器打停
+        let mut data = vec![0xffu8; 64];
+        data.extend_from_slice(&build_frame(b"{\"n\":1}"));
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&data).unwrap();
+        let (payloads, _) = decode_all(&mut decoder);
+
+        assert_eq!(payloads, vec![b"{\"n\":1}".to_vec()]);
+        assert!(!decoder.is_stopped());
+    }
+
+    #[test]
+    fn test_decoder_stops_after_repeated_corrupt_frames() {
+        let mut data = Vec::new();
+        for _ in 0..DEFAULT_MAX_ERRORS {
+            let mut corrupt = build_frame(b"{}");
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 0xff;
+            data.extend_from_slice(&corrupt);
+        }
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&data).unwrap();
+        let _ = decode_all(&mut decoder);
+        assert!(decoder.is_stopped());
     }
 }

@@ -101,18 +101,19 @@ pub fn parse_frame(buffer: &[u8]) -> ParseResult<Option<(Frame, usize)>> {
     let total_length = total_length as usize;
     let header_length = header_length as usize;
 
-    // 检查是否有完整的消息
-    if buffer.len() < total_length {
-        return Ok(None);
-    }
-
-    // 验证 Prelude CRC
+    // 先验证 Prelude CRC，再判断数据是否完整：
+    // 否则错位读出的随机长度会让解码器一直"等数据"，把后续正常帧全部吞掉
     let actual_prelude_crc = crc32(&buffer[..8]);
     if actual_prelude_crc != prelude_crc {
         return Err(ParseError::PreludeCrcMismatch {
             expected: prelude_crc,
             actual: actual_prelude_crc,
         });
+    }
+
+    // 检查是否有完整的消息
+    if buffer.len() < total_length {
+        return Ok(None);
     }
 
     // 读取 Message CRC
@@ -161,6 +162,18 @@ mod tests {
     fn test_frame_insufficient_data() {
         let buffer = [0u8; 10]; // 小于 PRELUDE_SIZE
         assert!(matches!(parse_frame(&buffer), Ok(None)));
+    }
+
+    #[test]
+    fn test_frame_prelude_crc_checked_before_waiting_for_body() {
+        // 声明长度 1000 但 prelude CRC 错误：应立即报错，而不是返回 Ok(None) 等待更多数据
+        let mut buffer = vec![0u8; 16];
+        buffer[0..4].copy_from_slice(&1000u32.to_be_bytes());
+        buffer[4..8].copy_from_slice(&0u32.to_be_bytes());
+        buffer[8..12].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
+
+        let result = parse_frame(&buffer);
+        assert!(matches!(result, Err(ParseError::PreludeCrcMismatch { .. })));
     }
 
     #[test]

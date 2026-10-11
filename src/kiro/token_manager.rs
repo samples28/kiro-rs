@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::common::fs_util::write_atomic;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
@@ -112,6 +113,70 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// Token 刷新的瞬态错误（网络错误、上游 429/5xx、响应解析失败）
+///
+/// 与认证类错误区分：瞬态错误不计入 refresh 失败（不会触发不可自愈的
+/// `TooManyRefreshFailures`），只按普通失败计数，由调用方退避后重试。
+#[derive(Debug)]
+pub(crate) struct TransientRefreshError {
+    pub message: String,
+}
+
+impl fmt::Display for TransientRefreshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for TransientRefreshError {}
+
+fn transient_refresh_error(context: &str, err: impl fmt::Display) -> anyhow::Error {
+    TransientRefreshError {
+        message: format!("{}: {}", context, err),
+    }
+    .into()
+}
+
+/// 将刷新结果中的 token 相关字段合并到当前凭据
+///
+/// 刷新期间（网络 await 最长 60 秒）Admin 可能修改了优先级、代理、订阅信息等，
+/// 整体覆盖会把这些修改回滚，因此只合并刷新接口实际返回的字段。
+/// `before` 是发起刷新时使用的凭据快照：refresh_token/profile_arn 只有在刷新响应
+/// 确实改变了它们时才写回，避免用旧快照覆盖刷新期间回填的 ARN。
+fn apply_refreshed_tokens(
+    target: &mut KiroCredentials,
+    before: &KiroCredentials,
+    refreshed: &KiroCredentials,
+) {
+    target.access_token = refreshed.access_token.clone();
+    target.expires_at = refreshed.expires_at.clone();
+    if refreshed.refresh_token != before.refresh_token {
+        target.refresh_token = refreshed.refresh_token.clone();
+    }
+    if refreshed.profile_arn != before.profile_arn {
+        target.profile_arn = refreshed.profile_arn.clone();
+    }
+}
+
+/// 刷新响应缺少 expiresIn 时使用的默认有效期（秒）
+const DEFAULT_TOKEN_EXPIRES_IN_SECS: i64 = 3600;
+
+/// 可配置时长的上限（1 年），防止 `Instant + Duration` 溢出 panic
+const MAX_CONFIG_DURATION_SECS: u64 = 365 * 24 * 3600;
+
+/// 将配置中的秒数转换为 Duration，并截断到安全上限
+fn capped_duration_secs(secs: u64) -> StdDuration {
+    StdDuration::from_secs(secs.min(MAX_CONFIG_DURATION_SECS))
+}
+
+/// Admin 写入时长配置前的上限校验
+fn validate_duration_secs(name: &str, secs: u64) -> anyhow::Result<()> {
+    if secs > MAX_CONFIG_DURATION_SECS {
+        bail!("{}不能超过 {} 秒", name, MAX_CONFIG_DURATION_SECS);
+    }
+    Ok(())
+}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -184,7 +249,8 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| transient_refresh_error("Social Token 刷新请求发送失败", e))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -208,10 +274,16 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(transient_refresh_error(error_msg, format!("{} {}", status, body_text)));
+        }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: RefreshResponse = response.json().await?;
+    let data: RefreshResponse = response
+        .json()
+        .await
+        .map_err(|e| transient_refresh_error("解析 Social Token 刷新响应失败", e))?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -224,12 +296,27 @@ async fn refresh_social_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
-    if let Some(expires_in) = data.expires_in {
-        let expires_at = Utc::now() + Duration::seconds(expires_in);
-        new_credentials.expires_at = Some(expires_at.to_rfc3339());
-    }
+    new_credentials.expires_at = Some(new_expires_at(data.expires_in));
 
     Ok(new_credentials)
+}
+
+/// 根据刷新响应的 expiresIn 计算新的过期时间
+///
+/// 响应缺少 expiresIn（或给出非正数）时使用默认有效期，避免沿用旧的过期时间
+/// 导致"刷新后仍过期"被误判为刷新失败。
+fn new_expires_at(expires_in: Option<i64>) -> String {
+    let secs = match expires_in {
+        Some(s) if s > 0 => s,
+        _ => {
+            tracing::warn!(
+                "Token 刷新响应缺少有效 expiresIn，按默认 {}s 计算过期时间",
+                DEFAULT_TOKEN_EXPIRES_IN_SECS
+            );
+            DEFAULT_TOKEN_EXPIRES_IN_SECS
+        }
+    };
+    (Utc::now() + Duration::seconds(secs)).to_rfc3339()
 }
 
 /// 刷新 IdC Token (AWS SSO OIDC)
@@ -281,7 +368,8 @@ async fn refresh_idc_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| transient_refresh_error("IdC Token 刷新请求发送失败", e))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -305,10 +393,16 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(transient_refresh_error(error_msg, format!("{} {}", status, body_text)));
+        }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: IdcRefreshResponse = response.json().await?;
+    let data: IdcRefreshResponse = response
+        .json()
+        .await
+        .map_err(|e| transient_refresh_error("解析 IdC Token 刷新响应失败", e))?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -317,10 +411,7 @@ async fn refresh_idc_token(
         new_credentials.refresh_token = Some(new_refresh_token);
     }
 
-    if let Some(expires_in) = data.expires_in {
-        let expires_at = Utc::now() + Duration::seconds(expires_in);
-        new_credentials.expires_at = Some(expires_at.to_rfc3339());
-    }
+    new_credentials.expires_at = Some(new_expires_at(data.expires_in));
 
     // 同步更新 profile_arn（如果 IdC 响应中包含）
     if let Some(profile_arn) = data.profile_arn {
@@ -657,6 +748,31 @@ enum DisabledReason {
     InvalidConfig,
 }
 
+impl DisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    /// 从凭据文件中持久化的字符串还原；缺失或未知值按手动禁用处理（与旧版本行为一致）
+    fn from_persisted(value: Option<&str>) -> Self {
+        match value {
+            Some("TooManyFailures") => DisabledReason::TooManyFailures,
+            Some("TooManyRefreshFailures") => DisabledReason::TooManyRefreshFailures,
+            Some("QuotaExceeded") => DisabledReason::QuotaExceeded,
+            Some("InvalidRefreshToken") => DisabledReason::InvalidRefreshToken,
+            Some("InvalidConfig") => DisabledReason::InvalidConfig,
+            _ => DisabledReason::Manual,
+        }
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -829,6 +945,16 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(60);
+/// 候选凭据全部处于 429 冷却时，单次请求愿意等待的最长时间
+const MAX_RATE_LIMIT_WAIT: StdDuration = StdDuration::from_secs(60);
+
+/// Token 刷新瞬态错误的退避时长（指数退避，上限 4 秒）
+fn refresh_retry_delay(attempt: usize) -> StdDuration {
+    const BASE_MS: u64 = 500;
+    const MAX_MS: u64 = 4_000;
+    let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(4) as u32));
+    StdDuration::from_millis(exp.min(MAX_MS))
+}
 /// 缓存中断持续时长
 /// 在 [min, max] 秒范围内生成随机间隔
 fn random_interrupt_delay(min_secs: u64, max_secs: u64) -> StdDuration {
@@ -837,7 +963,7 @@ fn random_interrupt_delay(min_secs: u64, max_secs: u64) -> StdDuration {
     } else {
         fastrand::u64(min_secs..=max_secs)
     };
-    StdDuration::from_secs(secs)
+    capped_duration_secs(secs)
 }
 
 /// 凭据选择结果
@@ -846,6 +972,8 @@ enum SelectResult {
     Ready(u64, KiroCredentials),
     /// 所有可用凭据都在冷却中，附带最早可用时刻
     CooldownUntil(Instant),
+    /// 候选凭据全部处于 429 限流冷却中，附带最早解除冷却的时刻
+    RateLimitedUntil(Instant),
     /// 无可用凭据（全部 disabled）
     None,
 }
@@ -941,8 +1069,9 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled,
+                    // 还原持久化的禁用原因，保证重启后 TooManyFailures 仍可自愈
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(DisabledReason::from_persisted(cred.disabled_reason.as_deref()))
                     } else {
                         None
                     },
@@ -1108,6 +1237,10 @@ impl MultiTokenManager {
                 e.failure_count = 0;
             }
         }
+        // 自愈结果也要落盘，否则重启后又会读回禁用状态
+        if let Err(e) = self.persist_credentials_locked(&entries, false) {
+            tracing::warn!("自愈后持久化凭据失败（重启后可能恢复为禁用）: {}", e);
+        }
         true
     }
 
@@ -1120,16 +1253,26 @@ impl MultiTokenManager {
         let global_seconds = *self.cooldown_seconds.lock();
         let global_max = *self.cooldown_max_requests.lock();
 
+        // 最大请求数为 0 时视为不限流（否则 earliest_available 会下标越界），
+        // 窗口时长截断到安全上限（防止 Instant + Duration 溢出）
+        let normalize = |secs: u64, max: u32| -> Option<(StdDuration, u32)> {
+            if max == 0 || secs == 0 {
+                None
+            } else {
+                Some((capped_duration_secs(secs), max))
+            }
+        };
+
         match cred.cooldown_enabled {
             Some(true) => {
                 let secs = cred.cooldown_seconds.unwrap_or(global_seconds);
                 let max = cred.cooldown_max_requests.unwrap_or(global_max);
-                Some((StdDuration::from_secs(secs), max))
+                normalize(secs, max)
             }
             Some(false) => None,
             None => {
                 if global_enabled {
-                    Some((StdDuration::from_secs(global_seconds), global_max))
+                    normalize(global_seconds, global_max)
                 } else {
                     None
                 }
@@ -1183,8 +1326,8 @@ impl MultiTokenManager {
             .copied()
             .collect();
 
-        if (in_window.len() as u32) < max_requests {
-            return now; // 已经可用
+        if max_requests == 0 || (in_window.len() as u32) < max_requests {
+            return now; // 已经可用（max_requests 为 0 视为不限流）
         }
 
         // 最早的请求过期后即可腾出一个位置
@@ -1192,7 +1335,9 @@ impl MultiTokenManager {
         let mut sorted = in_window;
         sorted.sort();
         let wait_idx = sorted.len() - max_requests as usize;
-        sorted[wait_idx] + window
+        sorted[wait_idx]
+            .checked_add(window)
+            .unwrap_or_else(|| now + capped_duration_secs(MAX_CONFIG_DURATION_SECS))
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -1209,6 +1354,8 @@ impl MultiTokenManager {
         let free_model_mappings = self.free_model_mappings.lock().clone();
 
         // 过滤可用凭据索引（未禁用 + 模型匹配 + 不在 429 冷却中）
+        // 同时记录"仅因 429 冷却被跳过"的凭据中最早解除冷却的时刻
+        let mut earliest_rate_limit_end: Option<Instant> = None;
         let available_indices: Vec<usize> = entries
             .iter()
             .enumerate()
@@ -1227,6 +1374,8 @@ impl MultiTokenManager {
                 // 429 冷却中跳过
                 if let Some(until) = e.rate_limit_cooldown_until {
                     if now < until {
+                        earliest_rate_limit_end =
+                            Some(earliest_rate_limit_end.map_or(until, |t| t.min(until)));
                         return false;
                     }
                 }
@@ -1236,6 +1385,10 @@ impl MultiTokenManager {
             .collect();
 
         if available_indices.is_empty() {
+            // 候选凭据全部处于 429 冷却：等待冷却结束，而不是当作"无可用凭据"立即失败
+            if let Some(until) = earliest_rate_limit_end {
+                return SelectResult::RateLimitedUntil(until);
+            }
             return SelectResult::None;
         }
 
@@ -1370,6 +1523,22 @@ impl MultiTokenManager {
                         tokio::time::sleep(wait).await;
                         continue;
                     }
+                    SelectResult::RateLimitedUntil(wake_at) => {
+                        // 429 只退避不切换：在上限内等待冷却结束，超出上限才报错
+                        let wait = wake_at.saturating_duration_since(Instant::now());
+                        if wait > MAX_RATE_LIMIT_WAIT {
+                            anyhow::bail!(
+                                "所有候选凭据均处于 429 限流冷却中，约 {}s 后恢复",
+                                wait.as_secs()
+                            );
+                        }
+                        tracing::info!(
+                            "所有候选凭据均处于 429 冷却中，等待 {}ms 后重试",
+                            wait.as_millis()
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                     SelectResult::None => {
                         if self.try_self_heal() {
                             continue;
@@ -1395,6 +1564,17 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 瞬态错误（网络抖动、上游 429/5xx）：不计入刷新失败，退避后重试，
+                    // 避免一次网络抖动就把凭据（乃至整个池）永久禁用
+                    // 按普通失败计数（TooManyFailures 可自愈），持续失败的凭据仍能被故障转移
+                    if e.downcast_ref::<TransientRefreshError>().is_some() {
+                        tracing::warn!("凭据 #{} Token 刷新遇到瞬态错误，退避后重试: {}", id, e);
+                        self.report_failure(id);
+                        attempt_count += 1;
+                        tokio::time::sleep(refresh_retry_delay(attempt_count)).await;
+                        continue;
+                    }
+
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1490,20 +1670,24 @@ impl MultiTokenManager {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                 }
 
-                // 更新凭据
-                {
+                // 只合并刷新得到的 token 字段，避免覆盖刷新期间 Admin 等写入的其他字段
+                let merged = {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                    match entries.iter_mut().find(|e| e.id == id) {
+                        Some(entry) => {
+                            apply_refreshed_tokens(&mut entry.credentials, &current_creds, &new_creds);
+                            entry.credentials.clone()
+                        }
+                        None => new_creds,
                     }
-                }
+                };
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
 
-                new_creds
+                merged
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -1571,8 +1755,13 @@ impl MultiTokenManager {
             .map(|e| {
                 let mut cred = e.credentials.clone();
                 cred.canonicalize_auth_method();
-                // 同步 disabled 状态到凭据对象
+                // 同步 disabled 状态及原因到凭据对象（原因决定重启后能否自愈）
                 cred.disabled = e.disabled;
+                cred.disabled_reason = if e.disabled {
+                    e.disabled_reason.map(|r| r.as_str().to_string())
+                } else {
+                    None
+                };
                 cred
             })
             .collect();
@@ -1581,11 +1770,12 @@ impl MultiTokenManager {
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        // 原子写入：中途崩溃不会截断凭据文件（refreshToken 轮换后旧值已作废，丢失即不可恢复）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| write_atomic(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_atomic(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         self.is_multiple_format.store(true, Ordering::Relaxed);
@@ -1672,7 +1862,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_atomic(&path, json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     self.stats_dirty.store(false, Ordering::Relaxed);
@@ -1735,7 +1925,7 @@ impl MultiTokenManager {
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             let cooldown_secs = entry.rate_limit_cooldown_secs_override.unwrap_or(global_cooldown_secs);
             entry.rate_limit_count += 1;
-            entry.rate_limit_cooldown_until = Some(Instant::now() + StdDuration::from_secs(cooldown_secs));
+            entry.rate_limit_cooldown_until = Some(Instant::now() + capped_duration_secs(cooldown_secs));
             tracing::info!("凭据 #{} 收到 429，进入 {}s 冷却（累计 {} 次）", id, cooldown_secs, entry.rate_limit_count);
         }
     }
@@ -2023,14 +2213,7 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                     cooldown_enabled: e.credentials.cooldown_enabled,
                     cooldown_seconds: e.credentials.cooldown_seconds,
@@ -2551,6 +2734,10 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
+        // 获取刷新锁防止并发刷新
+        let _guard = self.refresh_lock.lock().await;
+
+        // 拿锁后再读取凭据：其他请求可能刚完成 refreshToken 轮换，用旧值刷新会 invalid_grant
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2560,19 +2747,16 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
-
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let new_creds =
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
-        // 更新 entries 中对应凭据
+        // 只合并 token 字段到 entries 中对应凭据
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
+                apply_refreshed_tokens(&mut entry.credentials, &credentials, &new_creds);
                 entry.refresh_failure_count = 0;
             }
         }
@@ -2654,6 +2838,7 @@ impl MultiTokenManager {
         if seconds == 0 {
             anyhow::bail!("冷却窗口时长不能为 0");
         }
+        validate_duration_secs("冷却窗口时长", seconds)?;
         if max_requests == 0 {
             anyhow::bail!("冷却窗口内最大请求数不能为 0");
         }
@@ -2833,7 +3018,7 @@ impl MultiTokenManager {
         if now >= *self.cache_interrupt_next.lock() {
             *active = true;
             let duration = *self.cache_interrupt_duration_secs.lock();
-            *self.cache_interrupt_end.lock() = now + StdDuration::from_secs(duration);
+            *self.cache_interrupt_end.lock() = now + capped_duration_secs(duration);
             return true;
         }
         false
@@ -2860,6 +3045,8 @@ impl MultiTokenManager {
         if duration_secs == 0 {
             anyhow::bail!("中断时长必须大于 0");
         }
+        validate_duration_secs("间隔秒数", max_secs)?;
+        validate_duration_secs("中断时长", duration_secs)?;
         *self.cache_interrupt_enabled.lock() = enabled;
         *self.cache_interrupt_min_secs.lock() = min_secs;
         *self.cache_interrupt_max_secs.lock() = max_secs;
@@ -2890,7 +3077,7 @@ impl MultiTokenManager {
         json["cacheInterruptMaxSecs"] = serde_json::json!(max_secs);
         json["cacheInterruptDurationSecs"] = serde_json::json!(duration_secs);
         let output = serde_json::to_string_pretty(&json)?;
-        std::fs::write(&config_path, output)
+        write_atomic(&config_path, output)
             .with_context(|| format!("写入配置文件失败: {:?}", config_path))?;
         Ok(())
     }
@@ -3113,6 +3300,7 @@ impl MultiTokenManager {
             if s == 0 {
                 anyhow::bail!("冷却窗口时长不能为 0");
             }
+            validate_duration_secs("冷却窗口时长", s)?;
         }
         if let Some(m) = max_requests {
             if m == 0 {
@@ -3224,6 +3412,8 @@ impl MultiTokenManager {
 
     /// 设置 429 冷却时长（秒）
     pub fn set_rate_limit_cooldown_secs(&self, secs: u64) {
+        // 截断到安全上限，防止超大值落盘后每次 429 都溢出
+        let secs = secs.min(MAX_CONFIG_DURATION_SECS);
         *self.rate_limit_cooldown_secs.lock() = secs;
         tracing::info!("429 冷却时长已更新为 {}s", secs);
 
@@ -3245,7 +3435,7 @@ impl MultiTokenManager {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-        entry.rate_limit_cooldown_secs_override = secs;
+        entry.rate_limit_cooldown_secs_override = secs.map(|s| s.min(MAX_CONFIG_DURATION_SECS));
         tracing::info!("凭据 #{} 429 冷却时长设为: {:?}", id, secs);
         Ok(())
     }
@@ -3857,6 +4047,158 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    fn valid_token_credential() -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred
+    }
+
+    #[test]
+    fn test_disabled_reason_survives_persistence_round_trip() {
+        for reason in [
+            DisabledReason::Manual,
+            DisabledReason::TooManyFailures,
+            DisabledReason::TooManyRefreshFailures,
+            DisabledReason::QuotaExceeded,
+            DisabledReason::InvalidRefreshToken,
+            DisabledReason::InvalidConfig,
+        ] {
+            assert_eq!(DisabledReason::from_persisted(Some(reason.as_str())), reason);
+        }
+        // 旧版本文件没有 disabledReason 字段，按手动禁用处理
+        assert_eq!(DisabledReason::from_persisted(None), DisabledReason::Manual);
+    }
+
+    #[tokio::test]
+    async fn test_auto_disabled_credential_self_heals_after_restart() {
+        // 模拟重启：凭据文件里记录的是 TooManyFailures 自动禁用
+        let mut cred = valid_token_credential();
+        cred.disabled = true;
+        cred.disabled_reason = Some("TooManyFailures".to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+        assert_eq!(manager.available_count(), 0);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.token, "token");
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_manually_disabled_credential_is_not_healed_after_restart() {
+        let mut cred = valid_token_credential();
+        cred.disabled = true;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+        assert!(manager.acquire_context(None).await.is_err());
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_waits_for_rate_limit_cooldown() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = 1;
+        let manager =
+            MultiTokenManager::new(config, vec![valid_token_credential()], None, None, false)
+                .unwrap();
+
+        manager.report_rate_limit(1);
+        let start = Instant::now();
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert!(start.elapsed() >= StdDuration::from_millis(900), "应等待 429 冷却结束");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_rejects_long_rate_limit_cooldown_quickly() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = MAX_RATE_LIMIT_WAIT.as_secs() + 60;
+        let manager =
+            MultiTokenManager::new(config, vec![valid_token_credential()], None, None, false)
+                .unwrap();
+
+        manager.report_rate_limit(1);
+        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        assert!(err.contains("429"), "实际: {}", err);
+        // 429 冷却不应被误判为禁用
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_huge_rate_limit_cooldown_does_not_panic() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = u64::MAX;
+        let manager =
+            MultiTokenManager::new(config, vec![valid_token_credential()], None, None, false)
+                .unwrap();
+        manager.report_rate_limit(1);
+        manager.set_rate_limit_cooldown_secs(u64::MAX);
+        assert_eq!(manager.get_rate_limit_cooldown_secs(), MAX_CONFIG_DURATION_SECS);
+    }
+
+    #[test]
+    fn test_zero_cooldown_max_requests_does_not_panic() {
+        let mut cred = valid_token_credential();
+        cred.cooldown_enabled = Some(true);
+        cred.cooldown_seconds = Some(60);
+        cred.cooldown_max_requests = Some(0);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        for _ in 0..3 {
+            assert!(matches!(
+                manager.select_next_credential(None),
+                SelectResult::Ready(1, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_earliest_available_with_zero_max_requests() {
+        let now = Instant::now();
+        let history = VecDeque::new();
+        assert_eq!(
+            MultiTokenManager::earliest_available(&history, now, StdDuration::from_secs(60), 0),
+            now
+        );
+    }
+
+    #[test]
+    fn test_apply_refreshed_tokens_keeps_concurrent_changes() {
+        let mut before = KiroCredentials::default();
+        before.refresh_token = Some("rt1".to_string());
+        before.priority = 5;
+
+        // 刷新期间 Admin 修改了优先级并回填了 ARN
+        let mut current = before.clone();
+        current.priority = 1;
+        current.profile_arn = Some("arn:real".to_string());
+
+        let mut refreshed = before.clone();
+        refreshed.access_token = Some("new-at".to_string());
+        refreshed.refresh_token = Some("rt2".to_string());
+        refreshed.expires_at = Some("2099-01-01T00:00:00Z".to_string());
+
+        apply_refreshed_tokens(&mut current, &before, &refreshed);
+        assert_eq!(current.access_token.as_deref(), Some("new-at"));
+        assert_eq!(current.refresh_token.as_deref(), Some("rt2"));
+        assert_eq!(current.expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(current.priority, 1);
+        assert_eq!(current.profile_arn.as_deref(), Some("arn:real"));
+    }
+
+    #[test]
+    fn test_new_expires_at_defaults_when_missing() {
+        for expires_in in [None, Some(0), Some(-5)] {
+            let parsed = DateTime::parse_from_rfc3339(&new_expires_at(expires_in)).unwrap();
+            let remaining = parsed.with_timezone(&Utc) - Utc::now();
+            assert!(remaining > Duration::minutes(55), "expires_in={:?}", expires_in);
+        }
     }
 
     #[tokio::test]

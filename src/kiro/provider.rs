@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::common::debug_log::SharedRequestLog;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -26,6 +26,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 15;
+
+/// 上游空闲读超时（秒）：连续这么久收不到任何数据才判定失败。
+/// 不使用整体超时，否则超过 12 分钟的长回答（如长时间 thinking）会被硬切断。
+const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 720;
 
 /// Kiro API Provider
 ///
@@ -74,7 +78,7 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
+        let initial_client = build_streaming_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
@@ -102,7 +106,7 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_streaming_client(effective.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -231,8 +235,17 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 代理配置无效（如 URL 无法解析）时计入该凭据失败并换下一张，而不是直接跳出重试循环
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 构建 HTTP 客户端失败（代理配置无效？）: {}", ctx.id, e);
+                    last_error = Some(e);
+                    self.token_manager.report_failure(ctx.id);
+                    continue;
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -424,8 +437,17 @@ impl KiroProvider {
             }
             tracing::debug!("Kiro request body: {}", body);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 代理配置无效（如 URL 无法解析）时计入该凭据失败并换下一张，而不是直接跳出重试循环
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 构建 HTTP 客户端失败（代理配置无效？）: {}", ctx.id, e);
+                    last_error = Some(e);
+                    self.token_manager.report_failure(ctx.id);
+                    continue;
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")

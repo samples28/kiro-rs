@@ -2,3 +2,4 @@
 
 pub mod auth;
 pub mod debug_log;
+pub mod fs_util;

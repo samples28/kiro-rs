@@ -312,6 +312,7 @@ impl AdminService {
                 proxy_username,
                 proxy_password,
                 disabled: false,
+                disabled_reason: None,
                 kiro_api_key: req.kiro_api_key,
                 endpoint: req.endpoint,
                 cooldown_enabled: req.cooldown_enabled,
@@ -861,7 +862,7 @@ impl AdminService {
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = crate::common::fs_util::write_atomic(path, json) {
                     tracing::warn!("保存余额缓存失败: {}", e);
                 }
             }

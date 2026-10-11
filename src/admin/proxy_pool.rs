@@ -237,7 +237,7 @@ impl ProxyPool {
         };
         let entries = self.entries.lock();
         if let Ok(json) = serde_json::to_string_pretty(&*entries) {
-            if let Err(e) = std::fs::write(path, json) {
+            if let Err(e) = crate::common::fs_util::write_atomic(path, json) {
                 tracing::warn!("持久化代理池失败: {}", e);
             }
         }
@@ -249,7 +249,15 @@ impl ProxyPool {
             None => return Vec::new(),
         };
         match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    // 解析失败时备份原文件，避免下次 persist 用空数据覆盖导致代理池永久丢失
+                    let backup = crate::common::fs_util::backup_corrupt_file(path);
+                    tracing::error!("解析代理池文件失败，已备份到 {:?}: {}", backup, e);
+                    Vec::new()
+                }
+            },
             Err(_) => Vec::new(),
         }
     }

@@ -89,6 +89,11 @@ async fn main() {
         tracing::error!("配置文件中未设置 apiKey");
         std::process::exit(1);
     });
+    // 空 apiKey 会让空的 x-api-key 请求头通过常量时间比较，等于关闭鉴权
+    if api_key.trim().is_empty() {
+        tracing::error!("配置文件中的 apiKey 为空，拒绝启动");
+        std::process::exit(1);
+    }
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -205,7 +210,9 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    // 按字符截取前缀，避免多字节字符处切片 panic，也避免日志泄露半个 key
+    let key_prefix: String = api_key.chars().take(4).collect();
+    tracing::info!("API Key: {}***", key_prefix);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");

@@ -62,7 +62,15 @@ impl BillingStats {
         let path = path.as_ref().to_path_buf();
         let data = if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // 解析失败时备份原文件，避免下次保存用空数据覆盖导致计费数据永久丢失
+                        let backup = crate::common::fs_util::backup_corrupt_file(&path);
+                        tracing::error!("解析计费统计文件失败，已备份到 {:?}: {}", backup, e);
+                        BillingData::default()
+                    }
+                },
                 Err(_) => BillingData::default(),
             }
         } else {
@@ -144,7 +152,9 @@ impl BillingStats {
             if let Some(parent) = self.file_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&self.file_path, content);
+            if let Err(e) = crate::common::fs_util::write_atomic(&self.file_path, content) {
+                tracing::warn!("保存计费统计失败: {}", e);
+            }
         }
         *self.last_save.lock().unwrap() = Instant::now();
     }

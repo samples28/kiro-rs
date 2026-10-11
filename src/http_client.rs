@@ -49,8 +49,34 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    finish_client(builder, proxy, tls_backend)
+}
 
+/// 连接建立超时（秒）
+const STREAMING_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// 构建用于长时间流式响应的 HTTP Client
+///
+/// 不设置整体超时（`timeout` 会覆盖读取 body 的全过程，长回答会被硬切断），
+/// 改用连接超时 + 空闲读超时：只要上游持续输出数据就不会超时，
+/// 连接卡住超过 `idle_timeout_secs` 没有任何数据才判定失败。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    idle_timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .connect_timeout(Duration::from_secs(STREAMING_CONNECT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(idle_timeout_secs));
+    finish_client(builder, proxy, tls_backend)
+}
+
+fn finish_client(
+    mut builder: reqwest::ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -113,5 +139,18 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client() {
+        assert!(build_streaming_client(None, 720, TlsBackend::Rustls).is_ok());
+        let config = ProxyConfig::new("socks5://127.0.0.1:1080");
+        assert!(build_streaming_client(Some(&config), 720, TlsBackend::Rustls).is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client_rejects_invalid_proxy() {
+        let config = ProxyConfig::new("not a url");
+        assert!(build_streaming_client(Some(&config), 720, TlsBackend::Rustls).is_err());
     }
 }
