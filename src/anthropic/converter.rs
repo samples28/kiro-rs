@@ -260,16 +260,20 @@ pub fn convert_request(req: &MessagesRequest, model_id: &str) -> Result<Conversi
     // 4. 确定触发类型
     let chat_trigger_type = "MANUAL".to_string();
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, documents, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 末尾连续的 user 消息合并为 current_message（经过 prefill 预处理，末尾必为 user）
+    // 例如 [..., A(tool_use), U(tool_result), U("继续")]：两条 user 一起作为当前消息，
+    // 不能把前一条塞进历史再补一条模型从没说过的 assistant 回复
+    let current_start = trailing_user_run_start(messages);
+    let (text_content, images, documents, tool_results) =
+        process_messages_content(&messages[current_start..])?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, model_id, &mut tool_name_map)?;
+    // 历史只包含当前消息之前的部分；结尾必为 assistant（或为空），无需补占位回复
+    let mut history = build_history(req, &messages[..current_start], model_id, &mut tool_name_map)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -343,6 +347,36 @@ pub fn convert_request(req: &MessagesRequest, model_id: &str) -> Result<Conversi
     })
 }
 
+/// 返回末尾连续 user 消息段的起始下标（调用方保证 messages 非空且末尾为 user）
+fn trailing_user_run_start(messages: &[super::types::Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.role != "user")
+        .map_or(0, |i| i + 1)
+}
+
+/// 合并处理多条消息的内容（文本以换行连接，图片/文档/工具结果依次追加）
+fn process_messages_content(
+    messages: &[super::types::Message],
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
+    let mut text_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut documents = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for msg in messages {
+        let (text, imgs, docs, results) = process_message_content(&msg.content)?;
+        if !text.is_empty() {
+            text_parts.push(text);
+        }
+        images.extend(imgs);
+        documents.extend(docs);
+        tool_results.extend(results);
+    }
+
+    Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
 /// 处理消息内容，提取文本、图片、文档和工具结果
 fn process_message_content(
     content: &serde_json::Value,
@@ -370,6 +404,8 @@ fn process_message_content(
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
                                     images.push(KiroImage::from_base64(format, source.data));
+                                } else {
+                                    tracing::warn!("不支持的图片格式 {}，已忽略", source.media_type);
                                 }
                             }
                         }
@@ -384,7 +420,11 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
+                                // Kiro 的 toolResult 只承载文本：结果里的图片（如 Read 截图）
+                                // 提升到所在 user 消息的 images，否则模型会以为文件为空
+                                images.extend(result_images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -414,8 +454,8 @@ fn process_message_content(
 
 /// 从 media_type 获取图片格式
 fn get_image_format(media_type: &str) -> Option<String> {
-    match media_type {
-        "image/jpeg" => Some("jpeg".to_string()),
+    match media_type.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Some("jpeg".to_string()),
         "image/png" => Some("png".to_string()),
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
@@ -431,22 +471,49 @@ fn get_document_format(media_type: &str) -> Option<String> {
     }
 }
 
-/// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+/// 提取工具结果内容：返回 (文本, 图片)
+///
+/// 数组形式的 content 中，text 块拼接为文本，base64 image 块单独返回。
+/// 无法转换的图片（非 base64 来源或不支持的格式）以占位文本说明，避免静默消失。
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => (s.clone(), Vec::new()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut images = Vec::new();
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("image") => match image_from_block(item) {
+                        Some(image) => images.push(image),
+                        None => {
+                            tracing::warn!("tool_result 中的图片无法转换（仅支持 base64 的 jpeg/png/gif/webp），已用占位文本替代");
+                            parts.push("[图片：格式不受支持，未能传递]".to_string());
+                        }
+                    },
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            parts.push(text.to_string());
+                        }
+                    }
                 }
             }
-            parts.join("\n")
+            (parts.join("\n"), images)
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => (v.to_string(), Vec::new()),
+        None => (String::new(), Vec::new()),
     }
+}
+
+/// 将 Anthropic image 块（`{"type":"image","source":{"type":"base64",...}}`）转换为 Kiro 图片
+fn image_from_block(item: &serde_json::Value) -> Option<KiroImage> {
+    let source = item.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    let media_type = source.get("media_type").and_then(|v| v.as_str())?;
+    let data = source.get("data").and_then(|v| v.as_str())?;
+    let format = get_image_format(media_type)?;
+    Some(KiroImage::from_base64(format, data))
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -744,9 +811,8 @@ Requirements:\n\
 ///
 /// # Arguments
 /// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
+/// * `messages` - 作为历史的消息切片（不含末尾合并为 currentMessage 的连续 user 消息）。
+///   注意：该切片与 `req.messages` 不同，调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
@@ -814,9 +880,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     }
 
     // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
+    // 调用方传入的是 currentMessage 之前的消息，全部进入历史
+    let history_end_index = messages.len();
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
@@ -852,6 +917,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     }
 
     // 处理结尾的孤立 user 消息
+    // 正常情况下不会走到这里：末尾连续的 user 已合并进 currentMessage，历史以 assistant 结尾。
+    // 仅当历史中夹杂非 user/assistant 的未知 role 时兜底，保证 user/assistant 严格交替
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
@@ -1888,5 +1955,110 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    fn request_with_messages(messages: Vec<super::super::types::Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    fn msg(role: &str, content: serde_json::Value) -> super::super::types::Message {
+        super::super::types::Message {
+            role: role.to_string(),
+            content,
+        }
+    }
+
+    #[test]
+    fn test_trailing_user_messages_merge_into_current_without_fake_ok() {
+        // [U, A(tool_use), U(tool_result), U("继续")]：末尾两条 user 应一起成为当前消息
+        let req = request_with_messages(vec![
+            msg("user", serde_json::json!("读一下文件")),
+            msg("assistant", serde_json::json!([
+                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+            ])),
+            msg("user", serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file content"}
+            ])),
+            msg("user", serde_json::json!("继续，但别改测试")),
+        ]);
+
+        let state = convert_request(&req, "claude-sonnet-4.6").unwrap().conversation_state;
+
+        let fake_ok = state.history.iter().any(|m| {
+            matches!(m, Message::Assistant(a) if a.assistant_response_message.content == "OK")
+        });
+        assert!(!fake_ok, "历史中不应出现虚构的 OK 回复");
+
+        // 历史以 assistant(tool_use) 结尾，严格交替
+        assert!(matches!(state.history.last(), Some(Message::Assistant(_))));
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "继续，但别改测试");
+        let results = &current.user_input_message_context.tool_results;
+        assert_eq!(results.len(), 1, "tool_result 应保留在当前消息中");
+        assert_eq!(results[0].tool_use_id, "toolu_1");
+    }
+
+    #[test]
+    fn test_single_user_message_has_only_system_pair_in_history() {
+        let req = request_with_messages(vec![msg("user", serde_json::json!("Hello"))]);
+        let state = convert_request(&req, "claude-sonnet-4.6").unwrap().conversation_state;
+
+        // 仅有注入的 system user + assistant 配对
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.current_message.user_input_message.content, "Hello");
+    }
+
+    #[test]
+    fn test_tool_result_images_are_lifted_to_user_message() {
+        let content = Some(serde_json::json!([
+            {"type": "text", "text": "截图如下"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+        ]));
+
+        let (text, images) = extract_tool_result_content(&content);
+        assert_eq!(images.len(), 1, "base64 图片应被提取");
+        assert_eq!(images[0].format, "png");
+        assert!(text.contains("截图如下"));
+        assert!(text.contains("未能传递"), "无法转换的图片应留下占位说明: {}", text);
+    }
+
+    #[test]
+    fn test_tool_result_image_reaches_current_message() {
+        let req = request_with_messages(vec![
+            msg("user", serde_json::json!("看下截图")),
+            msg("assistant", serde_json::json!([
+                {"type": "tool_use", "id": "toolu_img", "name": "Read", "input": {"path": "a.png"}}
+            ])),
+            msg("user", serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "toolu_img", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}}
+                ]}
+            ])),
+        ]);
+
+        let state = convert_request(&req, "claude-sonnet-4.6").unwrap().conversation_state;
+        let images = &state.current_message.user_input_message.images;
+        assert_eq!(images.len(), 1, "tool_result 里的图片应进入当前消息");
+        assert_eq!(images[0].format, "jpeg");
+    }
+
+    #[test]
+    fn test_image_jpg_alias_is_accepted() {
+        assert_eq!(get_image_format("image/jpg").as_deref(), Some("jpeg"));
+        assert_eq!(get_image_format("IMAGE/PNG").as_deref(), Some("png"));
+        assert_eq!(get_image_format("image/bmp"), None);
     }
 }

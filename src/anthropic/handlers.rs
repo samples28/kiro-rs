@@ -680,10 +680,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
                     thinking_type: "adaptive".to_string(),
                     budget_tokens: 20000,
                 });
-                payload.output_config = Some(OutputConfig {
-                    effort: "low".to_string(),
-                    format: None,
-                });
+                set_output_effort(payload, "low");
             }
         }
         return;
@@ -714,10 +711,23 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     if is_adaptive_opus {
         let effort = if is_opus_4_7 { "max" } else { "high" };
-        payload.output_config = Some(OutputConfig {
-            effort: effort.to_string(),
-            format: None,
-        });
+        set_output_effort(payload, effort);
+    }
+}
+
+/// 只改写 output_config.effort，保留客户端传入的 format（结构化输出 json_schema）
+///
+/// 直接整体赋值 `OutputConfig { format: None, .. }` 会把用户的 format 抹掉，
+/// converter 就不会生成结构化输出指令，客户端拿到的不再是 JSON。
+fn set_output_effort(payload: &mut MessagesRequest, effort: &str) {
+    match payload.output_config.as_mut() {
+        Some(config) => config.effort = effort.to_string(),
+        None => {
+            payload.output_config = Some(OutputConfig {
+                effort: effort.to_string(),
+                format: None,
+            })
+        }
     }
 }
 
@@ -743,4 +753,69 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::OutputFormat;
+
+    fn request(model: &str, output_config: Option<OutputConfig>) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: Vec::new(),
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config,
+            metadata: None,
+        }
+    }
+
+    fn json_schema_config() -> OutputConfig {
+        OutputConfig {
+            effort: "medium".to_string(),
+            format: Some(OutputFormat {
+                format_type: "json_schema".to_string(),
+                schema: Some(serde_json::json!({"type": "object"})),
+                name: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_default_adaptive_injection_keeps_structured_output_format() {
+        let mut payload = request("claude-opus-4-6", Some(json_schema_config()));
+        override_thinking_from_model_name(&mut payload);
+
+        let config = payload.output_config.expect("output_config 应存在");
+        assert_eq!(config.effort, "low");
+        assert_eq!(
+            config.format.expect("format 不应被抹掉").format_type,
+            "json_schema"
+        );
+    }
+
+    #[test]
+    fn test_thinking_suffix_keeps_structured_output_format() {
+        let mut payload = request("claude-opus-4-7-thinking", Some(json_schema_config()));
+        override_thinking_from_model_name(&mut payload);
+
+        let config = payload.output_config.expect("output_config 应存在");
+        assert_eq!(config.effort, "max");
+        assert!(config.format.is_some(), "format 不应被抹掉");
+    }
+
+    #[test]
+    fn test_effort_is_set_when_output_config_absent() {
+        let mut payload = request("claude-opus-4-6-thinking", None);
+        override_thinking_from_model_name(&mut payload);
+
+        let config = payload.output_config.expect("output_config 应被创建");
+        assert_eq!(config.effort, "high");
+        assert!(config.format.is_none());
+    }
 }

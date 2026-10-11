@@ -628,6 +628,8 @@ pub struct StreamContext {
     pub model_prices: Option<std::collections::HashMap<String, crate::model::config::ModelPrice>>,
     /// 输出 token 估算倍率（默认 1.0）
     pub output_ratio: f64,
+    /// 是否已记账（防止 generate_final_events 与 Drop 重复计费）
+    billed: bool,
 }
 
 impl StreamContext {
@@ -664,6 +666,7 @@ impl StreamContext {
             credential_id: None,
             model_prices: None,
             output_ratio: 1.0,
+            billed: false,
         }
     }
 
@@ -1294,22 +1297,10 @@ impl StreamContext {
         };
 
         // 输出 token 套用 output 倍率
-        let scaled_output = ((self.output_tokens as f64) * self.output_ratio).ceil() as i32;
+        let scaled_output = self.scaled_output_tokens();
 
         // 记录计费统计
-        if final_input_tokens > 0 || scaled_output > 0 {
-            if let (Some(cred_id), Some(prices)) = (self.credential_id, self.model_prices.as_ref()) {
-                if let Some(billing) = crate::admin::billing::get() {
-                    let usage = crate::admin::billing::RequestUsage {
-                        input_tokens: final_input_tokens,
-                        output_tokens: scaled_output,
-                        cache_read_tokens: self.cache_usage.cache_read_input_tokens,
-                        cache_write_tokens: self.cache_usage.cache_creation_input_tokens,
-                    };
-                    billing.record(cred_id, &self.model, &usage, prices);
-                }
-            }
-        }
+        self.record_billing(final_input_tokens, scaled_output);
 
         // 生成最终事件
         events.extend(
@@ -1346,6 +1337,62 @@ impl StreamContext {
         }
 
         events
+    }
+}
+
+impl StreamContext {
+    /// 套用 output 倍率后的输出 token 数
+    fn scaled_output_tokens(&self) -> i32 {
+        ((self.output_tokens as f64) * self.output_ratio).ceil() as i32
+    }
+
+    /// 记录计费统计（每个流只记一次）
+    fn record_billing(&mut self, input_tokens: i32, output_tokens: i32) {
+        if self.billed {
+            return;
+        }
+        self.billed = true;
+
+        if input_tokens <= 0 && output_tokens <= 0 {
+            return;
+        }
+        if let (Some(cred_id), Some(prices)) = (self.credential_id, self.model_prices.as_ref()) {
+            if let Some(billing) = crate::admin::billing::get() {
+                let usage = crate::admin::billing::RequestUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: self.cache_usage.cache_read_input_tokens,
+                    cache_write_tokens: self.cache_usage.cache_creation_input_tokens,
+                };
+                billing.record(cred_id, &self.model, &usage, prices);
+            }
+        }
+    }
+}
+
+impl Drop for StreamContext {
+    /// 客户端中途断开（如 Claude Code 里按 Esc）时，axum 直接丢弃整个流，
+    /// generate_final_events 不会被调用。上游额度已经消耗，这里兜底记账
+    fn drop(&mut self) {
+        if self.billed {
+            return;
+        }
+        // 只在真正发起过上游请求（已有凭据）时计费；未收到任何输出时只计输入
+        if self.credential_id.is_none() {
+            return;
+        }
+        let output_tokens = self.scaled_output_tokens();
+        let input_tokens = if self.has_error && output_tokens == 0 {
+            0
+        } else {
+            self.cache_usage.input_tokens
+        };
+        tracing::info!(
+            "流式请求在结束前被中断，按已产生的用量计费: input={}, output={}",
+            input_tokens,
+            output_tokens
+        );
+        self.record_billing(input_tokens, output_tokens);
     }
 }
 
@@ -2008,6 +2055,31 @@ mod tests {
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
+    }
+
+    #[test]
+    fn test_billing_recorded_once_on_normal_finish() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", true, false, HashMap::new(), CacheUsage::default());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("你好");
+        assert!(!ctx.billed);
+        let _ = ctx.generate_final_events();
+        assert!(ctx.billed, "正常结束后应已记账");
+        // 再次调用不应重复计费（Drop 时也会因 billed=true 跳过）
+        ctx.record_billing(100, 100);
+        assert!(ctx.billed);
+    }
+
+    #[test]
+    fn test_interrupted_stream_is_billed_on_drop() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", true, false, HashMap::new(), CacheUsage::default());
+        ctx.credential_id = Some(1);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("部分输出");
+        assert!(!ctx.billed, "未结束前不应记账");
+        assert!(ctx.scaled_output_tokens() > 0);
+        // 模拟客户端中途断开：直接丢弃，Drop 中兜底记账，不应 panic
+        drop(ctx);
     }
 
     #[test]
